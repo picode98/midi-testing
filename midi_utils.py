@@ -71,11 +71,11 @@ class CustomSynth(ABC):
         self.output_stream = output or sd.OutputStream(samplerate=sample_rate)
         self.active_oscs: Dict[Tuple[int, int], List[CustomOsc]] = dict()
 
-    def on_key_on(self, instrument: midi.Input, event: MIDIMessage) -> List[CustomOsc]:
+    def on_key_on(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomOsc]):
         return NotImplemented
 
-    def on_key_off(self, instrument: midi.Input, event: MIDIMessage) -> List[CustomOsc]:
-        return []
+    def on_key_off(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomOsc]):
+        oscs.clear()
 
     def update_output(self):
         for instrument in self.instruments:
@@ -85,10 +85,13 @@ class CustomSynth(ABC):
                 decoded_events = [decode_message(payload) for payload, _ in events]
                 for event in decoded_events:
                     if isinstance(event, KeyOnMessage):
-                        self.active_oscs[(instrument.device_id, event.key_num)] = self.on_key_on(instrument, event)
+                        if not (instrument.device_id, event.key_num) in self.active_oscs:
+                            self.active_oscs[(instrument.device_id, event.key_num)] = []
+
+                        self.on_key_on(instrument, event, self.active_oscs[(instrument.device_id, event.key_num)])
                         print(f'Playing key {get_piano_key_frequency(event.key_num)}')
                     elif isinstance(event, KeyOffMessage):
-                        self.active_oscs[(instrument.device_id, event.key_num)] = self.on_key_off(instrument, event)
+                        self.on_key_off(instrument, event, self.active_oscs[(instrument.device_id, event.key_num)])
 
         if not self.output_stream.active:
             self.output_stream.start()
@@ -96,6 +99,7 @@ class CustomSynth(ABC):
         if self.output_stream.write_available > 0:
             accum_buf = np.zeros(shape=(self.output_stream.write_available, 2), dtype=np.double)
             for osc_list in self.active_oscs.values():
+                osc_list = [osc for osc in osc_list if not osc.is_complete()]
                 for osc in osc_list:
                     accum_buf += osc.play_frames(accum_buf.shape[0])
                 # print(accum_buf)

@@ -74,7 +74,37 @@ class CustomOsc(ABC):
         total_frames = int(length * self.sample_rate)
         return self.play_frames(total_frames)
 
+    def is_complete(self) -> bool:
+        return False
 
+
+def Fadeable(cls):
+    class FadeableMixin(cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.fade_coeff: float = 1
+            self.fade_rate: float = 0
+
+        def play_frames(self, num_frames: int):
+            new_fade_coeff = self.fade_coeff - num_frames * self.fade_rate / self.sample_rate
+            fade_mul_array = np.linspace(self.fade_coeff, new_fade_coeff, num_frames)[:, np.newaxis]
+
+            if new_fade_coeff < 0:
+                new_fade_coeff = 0
+                fade_mul_array[fade_mul_array < 0] = 0
+
+            faded_input = super().play_frames(num_frames) * fade_mul_array
+
+            self.fade_coeff = new_fade_coeff
+            return faded_input
+
+        def is_complete(self) -> bool:
+            return super().is_complete() or self.fade_coeff == 0
+
+    return FadeableMixin
+
+
+@Fadeable
 class CustomSineOsc(CustomOsc):
     def __init__(self, param_callback, sample_rate=44100):
         super().__init__(sample_rate)
@@ -95,6 +125,7 @@ class CustomSineOsc(CustomOsc):
         return frame_array
 
 
+@Fadeable
 class CustomSawtoothOsc(CustomOsc):
     def __init__(self, param_callback, leading_edge=False, sample_rate=44100):
         super().__init__(sample_rate)

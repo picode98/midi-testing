@@ -25,10 +25,14 @@ from utils import CustomSineOsc
 #     outdata[:] = accum_buf.clip(min=-1, max=1).astype(np.float32)
 
 class TestSynth(CustomSynth):
-    def on_key_on(self, instrument: midi.Input, event: MIDIMessage) -> List[CustomOsc]:
-        return [CustomSineOsc(
-                    lambda t, e=event: (get_piano_key_frequency(e.key_num) + 100 * t, e.velocity)
-                )]
+    def on_key_on(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomOsc]):
+        oscs.append(CustomSineOsc(
+                        lambda t, e=event: (get_piano_key_frequency(e.key_num) + 100 * t, e.velocity)
+                    ))
+
+    def on_key_off(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomSineOsc]):
+        for osc in oscs:
+            osc.fade_rate = 0.2
 
 
 synth = TestSynth()
