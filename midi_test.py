@@ -1,5 +1,9 @@
+import math
+
+import pygame
+
 from midi_utils import *
-from utils import CustomSineOsc
+from utils import CustomPowerWaveOsc, CustomSineOsc, MouseVelocityInput
 
 
 # midi.init()
@@ -25,19 +29,52 @@ from utils import CustomSineOsc
 #     outdata[:] = accum_buf.clip(min=-1, max=1).astype(np.float32)
 
 class TestSynth(CustomSynth):
-    def on_key_on(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomOsc]):
-        oscs.append(CustomSineOsc(
-                        lambda t, e=event: (get_piano_key_frequency(e.key_num) + 100 * t, e.velocity)
-                    ))
+    def __init__(self):
+        super().__init__()
+        self.effect_on = False
+        self.mouse_in = MouseVelocityInput()
 
-    def on_key_off(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomSineOsc]):
+    def on_key_on(self, instrument: midi.Input, event: KeyOnMessage, oscs: List[CustomOsc]):
+        mouse_in = self.mouse_in
+        class TestSynthOsc1(CustomSineOsc):
+            def get_amplitudes(self, time_vector):
+                return event.velocity / 10.0
+
+            def get_frequencies(self, time_vector):
+                return get_piano_key_frequency(event.key_num)
+
+        class TestSynthOsc2(CustomSineOsc):
+            def get_amplitudes(self, time_vector):
+                return event.velocity / 10.0
+
+            def get_frequencies(self, time_vector):
+                return get_piano_key_frequency(event.key_num) + (mouse_in.current_vel / 50.0)
+
+        oscs += [TestSynthOsc1(), TestSynthOsc2()]
+
+        # oscs += [CustomPowerWaveOsc(
+        #                 lambda t, e=event: (get_piano_key_frequency(e.key_num), e.velocity / 10.0), power=4.0),
+        #          CustomPowerWaveOsc(
+        #                 lambda t, e=event: (get_piano_key_frequency(e.key_num) + 2.0, e.velocity / 10.0 if self.effect_on else 0.0), power=4.0)]
+
+    def on_key_off(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomPowerWaveOsc]):
         for osc in oscs:
-            osc.fade_rate = 0.2
+            osc.fade_rate = 5.0
+
+    def on_control_change(self, instrument: midi.Input, event: ControlChangeMessage):
+        if isinstance(event, SustainStartMessage):
+            self.effect_on = True
+        elif isinstance(event, SustainEndMessage):
+            self.effect_on = False
 
 
+pygame.init()
+pygame.display.set_mode()
 synth = TestSynth()
 
 while True:
+    pygame.event.pump()
+    synth.mouse_in.update()
     synth.update_output()
 
 # with sd.OutputStream(samplerate=44100) as out_stream:

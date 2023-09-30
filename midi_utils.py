@@ -20,6 +20,9 @@ class MIDIMessage:
         PITCH_WHEEL_CHANGE = 14
         SYSTEM_COMMON_MSG = 15
 
+    class CONTROL_CHANGE_TYPE(IntEnum):
+        SUSTAIN_CHANGE = 64
+
     def __init__(self, msg_type: STATUS_MESSAGE_TYPE):
         self.msg_type = msg_type
 
@@ -38,6 +41,19 @@ class KeyOffMessage(MIDIMessage):
         self.velocity = velocity
 
 
+class ControlChangeMessage(MIDIMessage):
+    def __init__(self):
+        super().__init__(self.STATUS_MESSAGE_TYPE.CONTROL_CHANGE)
+
+
+class SustainStartMessage(ControlChangeMessage):
+    pass
+
+
+class SustainEndMessage(ControlChangeMessage):
+    pass
+
+
 def decode_message(data_bytes: List[int]) -> MIDIMessage:
     MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE
     msg_type = MSG_ENUM(data_bytes[0] >> 4)
@@ -45,6 +61,14 @@ def decode_message(data_bytes: List[int]) -> MIDIMessage:
         return KeyOnMessage(data_bytes[1], data_bytes[2] / 127)
     elif msg_type == MSG_ENUM.KEY_OFF:
         return KeyOffMessage(data_bytes[1], data_bytes[2] / 127)
+    elif msg_type == MSG_ENUM.CONTROL_CHANGE:
+        CHG_TYPE_ENUM = MIDIMessage.CONTROL_CHANGE_TYPE
+        change_type = CHG_TYPE_ENUM(data_bytes[1])
+
+        if change_type == CHG_TYPE_ENUM.SUSTAIN_CHANGE:
+            return SustainEndMessage() if data_bytes[2] == 0 else SustainStartMessage()
+        else:
+            return ControlChangeMessage()
     else:
         return MIDIMessage(msg_type)
 
@@ -71,11 +95,19 @@ class CustomSynth(ABC):
         self.output_stream = output or sd.OutputStream(samplerate=sample_rate)
         self.active_oscs: Dict[Tuple[int, int], List[CustomOsc]] = dict()
 
-    def on_key_on(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomOsc]):
+    def on_key_on(self, instrument: midi.Input, event: KeyOnMessage, oscs: List[CustomOsc]):
         return NotImplemented
 
-    def on_key_off(self, instrument: midi.Input, event: MIDIMessage, oscs: List[CustomOsc]):
+    def on_key_off(self, instrument: midi.Input, event: KeyOffMessage, oscs: List[CustomOsc]):
         oscs.clear()
+
+    def on_control_change(self, instrument: midi.Input, event: ControlChangeMessage):
+        pass
+
+    def iter_oscs(self):
+        for osc_list in self.active_oscs.values():
+            for osc in osc_list:
+                yield osc
 
     def update_output(self):
         for instrument in self.instruments:
@@ -92,6 +124,8 @@ class CustomSynth(ABC):
                         print(f'Playing key {get_piano_key_frequency(event.key_num)}')
                     elif isinstance(event, KeyOffMessage):
                         self.on_key_off(instrument, event, self.active_oscs[(instrument.device_id, event.key_num)])
+                    elif isinstance(event, ControlChangeMessage):
+                        self.on_control_change(instrument, event)
 
         if not self.output_stream.active:
             self.output_stream.start()
