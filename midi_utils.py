@@ -72,6 +72,42 @@ def decode_message(data_bytes: List[int]) -> MIDIMessage:
     else:
         return MIDIMessage(msg_type)
 
+class WinVirtualKeyboard(midi.Input):
+    def __init__(self):
+        self.on_keys = set()
+        self.base_key = 30
+
+        self.device_id = -1
+
+    def poll(self):
+        import msvcrt
+        return msvcrt.kbhit()
+    
+    def read(self, num_events: int):
+        import msvcrt
+
+        result = []
+        while len(result) < num_events:
+            key = msvcrt.getch()
+            charmap = {b'a': 0, b'w': 1,  b's': 2,  b'e': 3,  b'd': 4, b'f': 5, b't': 6, b'g': 7, b'y': 8,
+                    b'h': 9, b'u': 10, b'j': 11, b'i': 12, b'k': 13, b'l': 14}
+            fixed_key_charmap = {b'v': 85 + 20, b'b': 86 + 20, b'n': 87 + 20, b'm': 88 + 20}
+            
+            if key in charmap or key in fixed_key_charmap:
+                MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE
+                adjusted_key = self.base_key + charmap[key] if key in charmap else fixed_key_charmap[key]
+                if adjusted_key in self.on_keys:
+                    result.append((bytes([MSG_ENUM.KEY_OFF.value << 4, adjusted_key, 127]), None))
+                    self.on_keys.remove(adjusted_key)
+                else:
+                    result.append((bytes([MSG_ENUM.KEY_ON.value << 4, adjusted_key, 127]), None))
+                    self.on_keys.add(adjusted_key)
+            elif key == b'q':
+                self.base_key -= 1
+            elif key == b'p':
+                self.base_key += 1
+
+        return result        
 
 def get_piano_key_frequency(key_num: int):
     return 55 * (2 ** ((key_num - 21) / 12))
@@ -86,9 +122,10 @@ class CustomSynth(ABC):
             dev_id = midi.get_default_input_id()
 
             if dev_id == -1:
-                raise Exception('Could not find any MIDI input devices.')
-
-            self.instruments = [midi.Input(dev_id)]
+                self.instruments = [WinVirtualKeyboard()]
+                # raise Exception('Could not find any MIDI input devices.')
+            else:
+                self.instruments = [midi.Input(dev_id)]
         else:
             self.instrument = list(inputs)
 
@@ -135,7 +172,10 @@ class CustomSynth(ABC):
             for osc_list in self.active_oscs.values():
                 osc_list = [osc for osc in osc_list if not osc.is_complete()]
                 for osc in osc_list:
-                    accum_buf += osc.play_frames(accum_buf.shape[0])
+                    result: np.ndarray = osc.play_frames(accum_buf.shape[0])
+                    if len(result.shape) == 1:
+                        result = np.transpose(np.tile(result, (2, 1)))
+                    accum_buf += result
                 # print(accum_buf)
 
             # print(accum_buf[:10])
