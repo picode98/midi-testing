@@ -57,9 +57,9 @@ class SustainEndMessage(ControlChangeMessage):
 def decode_message(data_bytes: List[int]) -> MIDIMessage:
     MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE
     msg_type = MSG_ENUM(data_bytes[0] >> 4)
-    if msg_type == MSG_ENUM.KEY_ON:
+    if msg_type == MSG_ENUM.KEY_ON and data_bytes[2] > 0:
         return KeyOnMessage(data_bytes[1], data_bytes[2] / 127)
-    elif msg_type == MSG_ENUM.KEY_OFF:
+    elif msg_type == MSG_ENUM.KEY_OFF or (msg_type == MSG_ENUM.KEY_ON and data_bytes[2] == 0):
         return KeyOffMessage(data_bytes[1], data_bytes[2] / 127)
     elif msg_type == MSG_ENUM.CONTROL_CHANGE:
         CHG_TYPE_ENUM = MIDIMessage.CONTROL_CHANGE_TYPE
@@ -91,7 +91,7 @@ class WinVirtualKeyboard(midi.Input):
             key = msvcrt.getch()
             charmap = {b'a': 0, b'w': 1,  b's': 2,  b'e': 3,  b'd': 4, b'f': 5, b't': 6, b'g': 7, b'y': 8,
                     b'h': 9, b'u': 10, b'j': 11, b'i': 12, b'k': 13, b'l': 14}
-            fixed_key_charmap = {b'v': 85 + 20, b'b': 86 + 20, b'n': 87 + 20, b'm': 88 + 20}
+            fixed_key_charmap = {b'x': 83 + 20, b'c': 84 + 20, b'v': 85 + 20, b'b': 86 + 20, b'n': 87 + 20, b'm': 88 + 20}
             
             if key in charmap or key in fixed_key_charmap:
                 MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE

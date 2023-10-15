@@ -76,6 +76,38 @@ class SimpleDistortEffect(SampleStage):
         max_threshold = np.max(np.absolute(input))
         clipped = np.clip(input, -max_threshold * (1.0 - self.magnitude / 2.0), max_threshold * (1.0 - self.magnitude / 2.0))
         return clipped / (1.0 - self.magnitude / 2.0)
+    
+class AMEffect(SampleStage):
+    def __init__(self, magnitude: float):
+        super().__init__(magnitude)
+        self.phase = 0.0
+
+    def __call__(self, input: np.ndarray, num_frames: int, sample_rate: int):
+        delta = 2.0 * pi * num_frames * (1.0 / (1.0 - self.magnitude * 0.95)) / sample_rate
+        amplitudes = np.cos(np.linspace(self.phase, self.phase + delta, num_frames, endpoint=False))
+        self.phase = (self.phase + delta) % (2.0 * pi)
+        return input * amplitudes
+    
+class FrequencyDomainWahWahEffect(SampleStage):
+    def __init__(self, magnitude: float):
+        super().__init__(magnitude)
+        self.phase = 0.0
+        self.dist_center_min, self.dist_center_max = 1.0, 12.0
+
+    def __call__(self, input: List[Tuple[np.ndarray, np.ndarray]], num_frames: int, sample_rate: int):
+        delta = 2.0 * pi * num_frames * (1.0 / (1.0 - self.magnitude * 0.95)) / sample_rate
+        dist_centers = self.dist_center_min + (self.dist_center_max - self.dist_center_min) \
+            * (np.sin(np.linspace(self.phase, self.phase + delta, num_frames, endpoint=False)) + 1.0) / 2.0
+        log_freqs = np.stack([np.log2(freqs) for freqs, _ in input], axis=1)
+        # center_freqs, freq_stddevs = np.average(log_freqs, axis=1), np.std(log_freqs, axis=1)
+        normalized_log_freqs = (log_freqs - np.reshape(dist_centers, (num_frames, 1))) / 1.0
+        amp_multipliers = 1.0 / (normalized_log_freqs ** 2 + 1.0)
+        # amp_multipliers /= np.reshape(np.sum(amp_multipliers, axis=1), (num_frames, 1))
+        amp_mat = np.stack([amps for _, amps in input], axis=1)
+        scaled_amp_mat = amp_mat * amp_multipliers
+        result_amps = scaled_amp_mat * np.reshape(np.sum(amp_mat, axis=1) / np.sum(scaled_amp_mat, axis=1), (num_frames, 1))
+        self.phase = (self.phase + delta) % (2.0 * pi)
+        return [(freqs, result_amps[:, i]) for i, (freqs, _) in enumerate(input)]
 
 @Fadeable
 class StageStackOsc(CustomOsc):
@@ -132,6 +164,6 @@ output3 = test_sine2(test_freq_amp2, 500, 44100)
 
 assert np.all(np.abs(output1 - np.concatenate((output2, output3), axis=0)) < 1e-6)
 
-synth = StageStackerSynth({85 + 20: HarmonicsStage, 87 + 20: VibratoStage}, {86 + 20: SimpleDistortEffect})
+synth = StageStackerSynth({83 + 20: FrequencyDomainWahWahEffect, 85 + 20: HarmonicsStage, 87 + 20: VibratoStage}, {84 + 20: AMEffect, 86 + 20: SimpleDistortEffect})
 while True:
     synth.update_output()
