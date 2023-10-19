@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Type, Tuple, Callable
 import numpy as np
 from pygame import midi
 
-from midi_utils import CustomSynth, KeyOffMessage, KeyOnMessage, get_piano_key_frequency
+from midi_utils import ControlChangeMessage, CustomSynth, KeyOffMessage, KeyOnMessage, get_piano_key_frequency
 from utils import CustomOsc, Fadeable
 
 class SampleStage(ABC):
@@ -15,6 +15,9 @@ class SampleStage(ABC):
 
     def __call__(self, input, num_frames: int, sample_rate: int) -> Any:
         raise NotImplementedError()
+    
+    def on_control_change(self, instrument: midi.Input, event: ControlChangeMessage):
+        pass
     
 class SineStage(SampleStage):
     def __init__(self):
@@ -34,7 +37,7 @@ class VibratoStage(SampleStage):
 
     def __call__(self, input: List[Tuple[np.ndarray, np.ndarray]], num_frames: int, sample_rate: int) -> Any:
         delta = 2.0 * pi * num_frames * self.frequency / sample_rate
-        freq_deltas = self.magnitude * 0.02 * np.sin(np.linspace(self.phase, self.phase + delta, num_frames, endpoint=False)) + 1.0
+        freq_deltas = self.magnitude * 0.04 * np.sin(np.linspace(self.phase, self.phase + delta, num_frames, endpoint=False)) + 1.0
         self.phase = (self.phase + delta) % (2.0 * pi)
         return [(freq_values * freq_deltas, amp_values) for freq_values, amp_values in input]
 
@@ -95,6 +98,7 @@ class FrequencyDomainWahWahEffect(SampleStage):
         self.dist_center_min, self.dist_center_max = 1.0, 12.0
 
     def __call__(self, input: List[Tuple[np.ndarray, np.ndarray]], num_frames: int, sample_rate: int):
+        print(self.magnitude)
         delta = 2.0 * pi * num_frames * (1.0 / (1.0 - self.magnitude * 0.95)) / sample_rate
         dist_centers = self.dist_center_min + (self.dist_center_max - self.dist_center_min) \
             * (np.sin(np.linspace(self.phase, self.phase + delta, num_frames, endpoint=False)) + 1.0) / 2.0
@@ -152,6 +156,16 @@ class StageStackerSynth(CustomSynth):
     def on_key_off(self, instrument: midi.Input, event: KeyOffMessage, oscs: List[CustomOsc]):
         for osc in oscs:
             osc.fade_rate = 5.0
+
+    def on_control_change(self, instrument: midi.Input, event: ControlChangeMessage):
+        for osc in self.iter_oscs():
+            for stage in osc.stages:
+                if event.control_change_type == ControlChangeMessage.CONTROL_CHANGE_TYPE.SWING_CHANGE:
+                    stage.magnitude = event.data_byte_2 / 127.0
+
+        for stage in self.freq_domain_stages + self.time_domain_stages:
+            if event.control_change_type == ControlChangeMessage.CONTROL_CHANGE_TYPE.SWING_CHANGE:
+                stage.magnitude = event.data_byte_2 / 127.0
 
 test_sine1 = SineStage()
 test_freq_amp1 = (np.full((1000,), 400.0), np.full((1000,), 1.0))

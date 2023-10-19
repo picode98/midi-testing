@@ -21,6 +21,11 @@ class MIDIMessage:
         SYSTEM_COMMON_MSG = 15
 
     class CONTROL_CHANGE_TYPE(IntEnum):
+        TEMPO_CHANGE = 21
+        SWING_CHANGE = 22
+        GATE_CHANGE = 23
+        MUTATE_CHANGE = 24
+        DEVIATE_CHANGE = 25
         SUSTAIN_CHANGE = 64
 
     def __init__(self, msg_type: STATUS_MESSAGE_TYPE):
@@ -42,8 +47,10 @@ class KeyOffMessage(MIDIMessage):
 
 
 class ControlChangeMessage(MIDIMessage):
-    def __init__(self):
+    def __init__(self, change_type: MIDIMessage.CONTROL_CHANGE_TYPE, data_byte_2: int):
         super().__init__(self.STATUS_MESSAGE_TYPE.CONTROL_CHANGE)
+        self.control_change_type = change_type
+        self.data_byte_2 = data_byte_2
 
 
 class SustainStartMessage(ControlChangeMessage):
@@ -68,7 +75,7 @@ def decode_message(data_bytes: List[int]) -> MIDIMessage:
         if change_type == CHG_TYPE_ENUM.SUSTAIN_CHANGE:
             return SustainEndMessage() if data_bytes[2] == 0 else SustainStartMessage()
         else:
-            return ControlChangeMessage()
+            return ControlChangeMessage(change_type, data_bytes[2])
     else:
         return MIDIMessage(msg_type)
 
