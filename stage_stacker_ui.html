@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <link rel="stylesheet" href="js/jquery-ui-1.13.2/jquery-ui.min.css">
+        <script type="text/javascript" src="js/jquery-3.7.1.min.js"></script>
+        <script type="text/javascript" src="js/jquery-ui-1.13.2/jquery-ui.min.js"></script>
+        <script type="text/javascript">
+            function createEffect(add_location, index, effect_type, effect_params)
+            {
+                let newElem = $(`<div class="ui-state-default"></div>`);
+                newElem.append($('<p></p>').text('Effect: ' + effect_type));
+
+                for(param of effect_params)
+                {
+                    let inputID = add_location + '_' + index + '_' + param.name;
+                    let label = $(`<label for="${inputID}"></label>`);
+                    label.text(param.name + ':');
+                    newElem.append(label);
+
+                    if(param.dtype === 'float' && param.min !== null && param.max !== null)
+                    {
+                        let param_name = param.name;
+                        let slider = $(`<div id="${inputID}" data-param-name="${param.name}"></div>`).slider({
+                            min: param.min,
+                            max: param.max,
+                            step: (param.max - param.min) / 100.0,
+                            value: param.initial_value,
+                            change: (event, ui) => window.pywebview.api.set_parameter(add_location, newElem.index(), param_name, ui.value)
+                        });
+                        newElem.append(slider);
+                    }
+                }
+
+                return newElem;
+            }
+
+            function addEffect(add_location, effect_type, effect_params)
+            {
+                let targetRoot = $(`.stage-list-root[data-location="${add_location}"]`);
+                let effectElem = createEffect(add_location, targetRoot.children().length, effect_type, effect_params);
+                targetRoot.append(effectElem);
+            }
+
+            function updateEffect(add_location, index, effect_type, effect_params)
+            {
+                let targetRoot = $(`.stage-list-root[data-location="${add_location}"]`);
+                let effectElem = createEffect(add_location, index, effect_type, effect_params);
+                $(targetRoot.children()[index]).replaceWith(effectElem);
+            }
+
+            function clearEffects(clear_location)
+            {
+                $(`.stage-list-root[data-location="${clear_location}"]`).empty();
+            }
+
+            $(() => {
+                $('.stage-list-root').sortable({
+                    change: function(event, ui) {
+                        let startIndex = ui.item.index(), endIndex = ui.placeholder.index();
+                        if(startIndex > endIndex)
+                        {
+                            startIndex -= 1;
+                        }
+                        else
+                        {
+                            endIndex -= 1;
+                        }
+
+                        // console.log([startIndex, endIndex]);
+                        window.pywebview.api.reorder_effects($(this).data('location'), startIndex, endIndex);
+                    }
+                });
+            });
+        </script>
+    </head>
+    <body>
+        <h1>Stage Stacker</h1>
+        <div class="stage-list-root" data-location="freq-domain"></div>
+        <div class="stage-list-root" data-location="generator"></div>
+        <div class="stage-list-root" data-location="time-domain"></div>
+    </body>
+</html>

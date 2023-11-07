@@ -136,7 +136,7 @@ class CustomSynth(ABC):
         else:
             self.instrument = list(inputs)
 
-        self.output_stream = output or sd.OutputStream(samplerate=sample_rate)
+        self.output_stream = output or sd.OutputStream(samplerate=sample_rate, latency=0.05)
         self.active_oscs: Dict[Tuple[int, int], List[CustomOsc]] = dict()
 
     def on_key_on(self, instrument: midi.Input, event: KeyOnMessage, oscs: List[CustomOsc]):
