@@ -138,6 +138,7 @@ class CustomSynth(ABC):
 
         self.output_stream = output or sd.OutputStream(samplerate=sample_rate, latency=0.05)
         self.active_oscs: Dict[Tuple[int, int], List[CustomOsc]] = dict()
+        self.recovering_stream = False
 
     def on_key_on(self, instrument: midi.Input, event: KeyOnMessage, oscs: List[CustomOsc]):
         return NotImplemented
@@ -186,4 +187,18 @@ class CustomSynth(ABC):
                 # print(accum_buf)
 
             # print(accum_buf[:10])
-            self.output_stream.write(accum_buf.clip(min=-1, max=1).astype(np.float32))
+                    
+            # print('foo')
+                    
+            try:
+                self.output_stream.write(accum_buf.clip(min=-1, max=1).astype(np.float32))
+                self.recovering_stream = False
+            except sd.PortAudioError as ex:
+                if self.recovering_stream:
+                    raise
+                else:
+                    self.recovering_stream = True
+                    print('Attempting to recover from stream error...')
+                    self.output_stream.stop()
+                    # self.output_stream = None
+                    self.output_stream = sd.OutputStream(samplerate=self.output_stream.samplerate, latency=self.output_stream.latency)

@@ -5,6 +5,14 @@
         <script type="text/javascript" src="js/jquery-3.7.1.min.js"></script>
         <script type="text/javascript" src="js/jquery-ui-1.13.2/jquery-ui.min.js"></script>
         <script type="text/javascript">
+            function registerEffect(location, type_name, display_name)
+            {
+                $(`.stage-add-buttons[data-location="${location}"]`).append(
+                    $('<button type="click"></button>').text(display_name)
+                        .on('click', () => window.pywebview.api.add_effect(location, type_name))
+                );
+            }
+
             function createEffect(add_location, index, effect_type, effect_params)
             {
                 let newElem = $(`<div class="ui-state-default"></div>`);
@@ -17,9 +25,9 @@
                     label.text(param.name + ':');
                     newElem.append(label);
 
+                    let param_name = param.name;
                     if(param.dtype === 'float' && param.min !== null && param.max !== null)
                     {
-                        let param_name = param.name;
                         let slider = $(`<div id="${inputID}" data-param-name="${param.name}"></div>`).slider({
                             min: param.min,
                             max: param.max,
@@ -28,6 +36,13 @@
                             change: (event, ui) => window.pywebview.api.set_parameter(add_location, newElem.index(), param_name, ui.value)
                         });
                         newElem.append(slider);
+                    }
+                    else if(param.dtype === 'string')
+                    {
+                        let textBox = $(`<input id="${inputID}" type="text">`).val(param.initial_value).on("blur", function() {
+                            window.pywebview.api.set_parameter(add_location, newElem.index(), param_name, $(this).val());
+                        });
+                        newElem.append(textBox);
                     }
                 }
 
@@ -75,8 +90,10 @@
     </head>
     <body>
         <h1>Stage Stacker</h1>
+        <div class="stage-add-buttons" data-location="freq-domain"></div>
         <div class="stage-list-root" data-location="freq-domain"></div>
         <div class="stage-list-root" data-location="generator"></div>
+        <div class="stage-add-buttons" data-location="time-domain"></div>
         <div class="stage-list-root" data-location="time-domain"></div>
     </body>
 </html>

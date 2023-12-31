@@ -1,19 +1,21 @@
 from abc import ABC
 from math import pi
 from copy import deepcopy
+import dataclasses
+import time
 from typing import Any, Dict, List, Type, Tuple, Callable
 
 import numpy as np
 from pygame import midi
 
 from midi_utils import ControlChangeMessage, CustomSynth, KeyOffMessage, KeyOnMessage, get_piano_key_frequency
-from utils import CustomOsc, Fadeable
+from utils import CustomOsc, Fadeable, linear_wave
 from stage_stacker_effect import SampleStage, StageParamInfo
 from stage_stacker_ui import StageStackerWebviewUI
 
 class PeriodicGeneratorStage(SampleStage):
-    def __init__(self, sample_rate=44100):
-        super().__init__(sample_rate)
+    def __init__(self):
+        super().__init__(1.0)
         self.phase = 0
         self.osc_time = 0
 
@@ -48,6 +50,29 @@ class SineStage(PeriodicGeneratorStage):
 class SawtoothStage(PeriodicGeneratorStage):
     def periodic_waveform(self, time_vector, phase_vector):
         return ((phase_vector + pi) % (2.0 * pi)) / pi - 1.0
+    
+class ExpressionGeneratorStage(PeriodicGeneratorStage):
+    def __init__(self, expression: str):
+        super().__init__()
+        self.expression = expression
+
+    def get_parameters(self):
+        return super().get_parameters() + [StageParamInfo('expression', 'string', self.expression)]
+
+    @property
+    def expression(self):
+        return self._expression
+    
+    @expression.setter
+    def expression(self, new_expression: str):
+        self._expression = new_expression
+        self._compiled_expr = compile(self._expression, '<effect expression>', mode='eval')
+
+    def periodic_waveform(self, time_vector, phase_vector):
+        return self.magnitude * eval(self._compiled_expr, {'x': phase_vector / (2.0 * pi), 't': time_vector, 'sin': lambda x: np.sin(x * 2.0 * pi),
+                                                           'cos': lambda x: np.cos(x * 2.0 * pi), 'exp': np.exp,
+                                                           'abs': np.absolute,
+                                                           'lin': lambda x: linear_wave(x * 2.0 * pi)})
 
 class VibratoStage(SampleStage):
     def __init__(self, magnitude: float):
@@ -78,21 +103,52 @@ class MixerStage(SampleStage):
         super().__init__(1.0)
         self.components = []
         self.new_component_factory = new_component_factory
+        self.component_params = dict()
+        self.gains = []
 
     def get_parameters(self):
-        return super().get_parameters() + [StageParamInfo(f'gain_{i + 1}', 'float', getattr(self, f'gain_{i + 1}'), 0.0, 1.0) for i, component in enumerate(self.components)]
+        return super().get_parameters() + [StageParamInfo(f'gain_{i + 1}', 'float', (self.gains[i] if i < len(self.gains) else 1.0), 0.0, 1.0) for i, component in enumerate(self.components)] \
+            + ([dataclasses.replace(param, name='component_' + param.name) for param in self.components[0].get_parameters()] if len(self.components) > 0 else [])
+    
+    def get_parameter(self, name: str) -> Any:
+        if name.startswith('gain_'):
+            gain_num = int(name.removeprefix('gain_'))
+            if len(self.gains) < gain_num:
+                return 1.0
+            else:
+                return self.gains[gain_num - 1]
+        elif name.startswith('component_'):
+            return self.component_params[name.removeprefix('component_')]
+        else:
+            return super().get_parameter(name)
+
+    def set_parameter(self, name: str, value: Any) -> None:
+        if name.startswith('gain_'):
+            gain_num = int(name.removeprefix('gain_'))
+            if len(self.gains) < gain_num:
+                self.gains += [1.0] * (gain_num - len(self.gains))
+            self.gains[gain_num - 1] = value
+        elif name.startswith('component_'):
+            self.component_params[name.removeprefix('component_')] = value
+            for component in self.components:
+                component.set_parameter(name.removeprefix('component_'), value)
+        else:
+            super().set_parameter(name, value)
 
     def __call__(self, input: List, num_frames: int, sample_rate: int):
         if len(input) < len(self.components):
             self.components = self.components[:len(input)]
             self.parameters_updated = True
         elif len(input) > len(self.components):
-            self.__dict__.update({f'gain_{i + 1}': getattr(self, f'gain_{i + 1}', 1.0) for i in range(len(self.components), len(input))})
-            self.components += [self.new_component_factory() for _ in range(len(input) - len(self.components))]
+            new_components = [self.new_component_factory() for _ in range(len(input) - len(self.components))]
+            for component in new_components:
+                for name, value in self.component_params.items():
+                    component.set_parameter(name, value)
+            self.components += new_components
             self.parameters_updated = True
 
         assert len(input) == len(self.components)
-        return sum(getattr(self, f'gain_{i + 1}') * stage(elem, num_frames, sample_rate) for i, (elem, stage) in enumerate(zip(input, self.components)))
+        return sum((self.gains[i] if i < len(self.gains) else 1.0) * stage(elem, num_frames, sample_rate) for i, (elem, stage) in enumerate(zip(input, self.components)))
     
 
 class HarmonicsStage(SampleStage):
@@ -184,13 +240,18 @@ class StageStackerSynth(CustomSynth):
         self.freq_domain_key_map = freq_domain_key_map
         self.time_domain_key_map = time_domain_key_map
 
-        self.template_osc = StageStackOsc(0.0, 0.0, [], MixerStage(lambda: SineStage()), [])
+        self.template_osc = StageStackOsc(0.0, 0.0, [], MixerStage(lambda: ExpressionGeneratorStage(expression='sin(x)')), [])
         # self.freq_domain_stages = []
         # self.time_domain_generator = MixerStage(lambda: SineStage()) # MixerStage([SineStage() for _ in range(4)])
         # self.time_domain_stages = []
 
         self.ui = StageStackerWebviewUI()
         self.ui.add_effect(self.template_osc.time_domain_generator, 'generator')
+
+        for effect in freq_domain_key_map.values():
+            self.ui.register_effect(effect, 'freq-domain')
+        for effect in time_domain_key_map.values():
+            self.ui.register_effect(effect, 'time-domain')
         # self.generator_stack = [HarmonicsStage(), VibratoStage(0.015), MixerStage([SineStage() for _ in range(4)])]
 
     # def _iter_current_and_templates(self):
@@ -201,6 +262,7 @@ class StageStackerSynth(CustomSynth):
 
     def update_output(self):
         ui_events = list(self.ui.get_events())
+
         for osc in [self.template_osc] + list(self.iter_oscs()):
             location_map = {'freq-domain': osc.freq_domain_stages, 'generator': [osc.time_domain_generator], 'time-domain': osc.time_domain_stages}
             for ui_event in ui_events:
@@ -209,9 +271,17 @@ class StageStackerSynth(CustomSynth):
                     reorder_list.insert(ui_event[3], reorder_list.pop(ui_event[2]))
                 elif ui_event[0] == 'set_param':
                     effect = location_map[ui_event[1]][ui_event[2]]
-                    setattr(effect, ui_event[3], ui_event[4])
+                    effect.set_parameter(ui_event[3], ui_event[4])
+                elif ui_event[0] == 'add_effect':
+                    types = {'freq-domain': self.freq_domain_key_map.values(), 'time-domain': self.time_domain_key_map.values()}[ui_event[1]]
+                    effect_class = next(effect_type for effect_type in types if effect_type.__name__ == ui_event[2])
+                    new_effect = effect_class(magnitude=1.0)
+                    location_map[ui_event[1]].append(new_effect)
+                    if osc == self.template_osc:
+                        self.ui.add_effect(new_effect, ui_event[1])
 
         for osc in [self.template_osc] + list(self.iter_oscs()):
+            location_map = {'freq-domain': osc.freq_domain_stages, 'generator': [osc.time_domain_generator], 'time-domain': osc.time_domain_stages}
             for location, stage_list in location_map.items():
                 for i, stage in enumerate(stage_list):
                     if stage.parameters_updated:
@@ -259,6 +329,13 @@ class StageStackerSynth(CustomSynth):
         #         stage.magnitude = event.data_byte_2 / 127.0
 
 if __name__ == '__main__':
+    # import sounddevice as sd
+    # s = sd.OutputStream(samplerate=44100)
+    # s.start()
+    # s.write(np.zeros((10000, 2), dtype=np.float32))
+    # s.write(np.zeros((10000, 2), dtype=np.float32))
+    # s.stop()
+
     test_sine1 = SineStage()
     test_freq_amp1 = (np.full((1000,), 400.0), np.full((1000,), 1.0))
     output1 = test_sine1(test_freq_amp1, 1000, 44100)

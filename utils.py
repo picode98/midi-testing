@@ -209,3 +209,6 @@ class CustomSawtoothOsc(CustomOsc):
 
         return frame_array
 
+def linear_wave(phase_vector: np.ndarray):
+    phase_shift = (phase_vector + math.pi / 2.0) % (2.0 * math.pi)
+    return 2.0 * np.abs(phase_shift / math.pi - 1.0) - 1.0
