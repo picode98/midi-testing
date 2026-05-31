@@ -79,13 +79,35 @@ def decode_message(data_bytes: List[int]) -> MIDIMessage:
     else:
         return MIDIMessage(msg_type)
 
-class WinVirtualKeyboard(midi.Input):
+class VirtualKeyboard(midi.Input):
     def __init__(self):
         self.on_keys = set()
         self.base_key = 30
 
         self.device_id = -1
 
+    def process_key(self, key: str):
+        charmap = {'a': 0, 'w': 1,  's': 2,  'e': 3,  'd': 4, 'f': 5, 't': 6, 'g': 7, 'y': 8,
+                            'h': 9, 'u': 10, 'j': 11, 'i': 12, 'k': 13, 'l': 14}
+        fixed_key_charmap = {'z': 82 + 20, 'x': 83 + 20, 'c': 84 + 20, 'v': 85 + 20, '': 86 + 20, 'n': 87 + 20, 'm': 88 + 20}
+            
+        if key in charmap or key in fixed_key_charmap:
+            MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE
+            adjusted_key = self.base_key + charmap[key] if key in charmap else fixed_key_charmap[key]
+            if adjusted_key in self.on_keys:
+                self.on_keys.remove(adjusted_key)
+                return (bytes([MSG_ENUM.KEY_OFF.value << 4, adjusted_key, 127]), None)
+                
+            else:
+                self.on_keys.add(adjusted_key)
+                return (bytes([MSG_ENUM.KEY_ON.value << 4, adjusted_key, 127]), None)
+        elif key == 'q':
+            self.base_key -= 1
+        elif key == 'p':
+            self.base_key += 1
+
+
+class WinVirtualKeyboard(VirtualKeyboard):
     def poll(self):
         import msvcrt
         return msvcrt.kbhit()
@@ -95,26 +117,53 @@ class WinVirtualKeyboard(midi.Input):
 
         result = []
         while len(result) < num_events:
-            key = msvcrt.getch()
-            charmap = {b'a': 0, b'w': 1,  b's': 2,  b'e': 3,  b'd': 4, b'f': 5, b't': 6, b'g': 7, b'y': 8,
-                    b'h': 9, b'u': 10, b'j': 11, b'i': 12, b'k': 13, b'l': 14}
-            fixed_key_charmap = {b'x': 83 + 20, b'c': 84 + 20, b'v': 85 + 20, b'b': 86 + 20, b'n': 87 + 20, b'm': 88 + 20}
-            
-            if key in charmap or key in fixed_key_charmap:
-                MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE
-                adjusted_key = self.base_key + charmap[key] if key in charmap else fixed_key_charmap[key]
-                if adjusted_key in self.on_keys:
-                    result.append((bytes([MSG_ENUM.KEY_OFF.value << 4, adjusted_key, 127]), None))
-                    self.on_keys.remove(adjusted_key)
-                else:
-                    result.append((bytes([MSG_ENUM.KEY_ON.value << 4, adjusted_key, 127]), None))
-                    self.on_keys.add(adjusted_key)
-            elif key == b'q':
-                self.base_key -= 1
-            elif key == b'p':
-                self.base_key += 1
+            key: bytes = msvcrt.getch()
+            if this_msg := self.process_key(key.decode('utf8')):
+                result.append(this_msg)
 
-        return result        
+        return result
+    
+class CursesVirtualKeyboard(VirtualKeyboard):
+    def __init__(self):
+        super().__init__()
+
+        import curses
+        self.screen = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        self.unread_keys = []
+
+        import atexit
+        atexit.register(lambda: curses.endwin())
+
+    def poll(self):
+        if len(self.unread_keys) > 0:
+            return True
+
+        import curses
+        self.screen.nodelay(True)
+        try:
+            self.unread_keys.append(self.screen.getkey())
+            return True
+        except curses.error:
+            return False
+        
+    def read(self, num_events):
+        self.screen.nodelay(False)
+
+        result = []
+        while len(result) < num_events:
+            if len(self.unread_keys) > 0:
+                this_key = self.unread_keys.pop(0)
+            else:
+                this_key = self.screen.getkey()
+
+            if this_msg := self.process_key(this_key):
+                result.append(this_msg)
+
+        return result
+
+    
 
 def get_piano_key_frequency(key_num: int):
     return 55 * (2 ** ((key_num - 21) / 12))
@@ -129,7 +178,11 @@ class CustomSynth(ABC):
             dev_id = midi.get_default_input_id()
 
             if dev_id == -1:
-                self.instruments = [WinVirtualKeyboard()]
+                try:
+                    import msvcrt
+                    self.instruments = [WinVirtualKeyboard()]
+                except ImportError:
+                    self.instruments = [CursesVirtualKeyboard()]
                 # raise Exception('Could not find any MIDI input devices.')
             else:
                 self.instruments = [midi.Input(dev_id)]
