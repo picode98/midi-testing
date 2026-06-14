@@ -48,10 +48,25 @@ def time_shift(buffer: np.ndarray, time_to_shift: float, preserve_length: bool =
             return np.concatenate((buffer, shift_buffer), axis=0)
 
 
+def read_wav_file(file_name: str):
+    wave_obj: wave.Wave_read = wave.open(file_name, 'rb')
+    frame_data = wave_obj.readframes(wave_obj.getnframes())
+    arr_dtype: np.dtype = {1: np.int8, 2: np.int16, 4: np.int32, 8: np.int64}[wave_obj.getsampwidth()]
+    int_array = np.frombuffer(frame_data, dtype=arr_dtype)
+    
+    if wave_obj.getnchannels() > 1:
+        int_array = int_array.reshape((wave_obj.getnframes(), wave_obj.getnchannels()), order='C')
+
+    sample_max = 2 ** (8 * wave_obj.getsampwidth() - 1) - 1
+    float_array = int_array / sample_max
+    wave_obj.close()
+    return (float_array, wave_obj.getframerate())
+
+
 def write_wav_file(file_name: str, frames: np.ndarray, sample_width: int = 2, sample_rate: int = 44100):
     wave_obj: wave.Wave_write = wave.open(file_name, 'wb')
     wave_obj.setnframes(frames.shape[0])
-    wave_obj.setnchannels(frames.shape[1])
+    wave_obj.setnchannels(frames.shape[1] if len(frames.shape) >= 2 else 1)
     wave_obj.setsampwidth(sample_width)
     wave_obj.setframerate(sample_rate)
 
@@ -111,6 +126,7 @@ class CustomPeriodicOsc(CustomOsc):
         super().__init__(sample_rate)
         self.phase = 0
         self.osc_time = 0
+        self._wrap_phase = True
 
     def periodic_waveform(self, time_vector, phase_vector):
         raise NotImplementedError()
@@ -132,11 +148,14 @@ class CustomPeriodicOsc(CustomOsc):
             amp_vec = np.full_like(time_vector, amp_vec)
 
         phase_vec = 2 * math.pi * np.cumsum(freq_vec) / self.sample_rate + self.phase
-        phase_vec = phase_vec % (2 * math.pi)
+
+        if self._wrap_phase:
+            phase_vec = phase_vec % (2 * math.pi)
+
         frame_array = amp_vec * self.periodic_waveform(time_vector, phase_vec)
 
         self.osc_time += num_frames / self.sample_rate
-        self.phase = phase_vec[-1]
+        self.phase = phase_vec[-1] % (2 * math.pi)
 
         return np.transpose(np.tile(frame_array, (2, 1)))
 

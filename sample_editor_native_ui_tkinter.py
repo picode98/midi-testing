@@ -17,99 +17,113 @@ class OutgoingMessageType(StrEnum):
     SET_ACTIVE_SNAPSHOT = 'set_active_snapshot'
 
 def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_process_recv_queue: multiprocessing.Queue):
-    import wx
-    import wx.lib.newevent
-    import wx.lib.scrolledpanel
+    import tkinter
+    import tkinter.filedialog
 
     from matplotlib.figure import Figure
+    from matplotlib.animation import FuncAnimation
 
 
     # Implement the default Matplotlib key bindings.
     from matplotlib.backend_bases import key_press_handler
-    from matplotlib.backends.backend_wxagg import (FigureCanvasWxAgg, NavigationToolbar2WxAgg)
+    from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
+                                                NavigationToolbar2Tk)
     
     import pathlib
 
-    ActiveItemChangedEvent, EVT_ACTIVE_ITEM_CHANGED = wx.lib.newevent.NewEvent()
-
-    class SnapshotHistoryWidget(wx.lib.scrolledpanel.ScrolledPanel):
-        def __init__(self, parent, height: int):
-            super().__init__(parent)
-            self.history_widgets: List[Tuple[Figure, FigureCanvasWxAgg]] = []
+    class SnapshotHistoryWidget(tkinter.Frame):
+        def __init__(self, master, height: int):
+            super().__init__(master, height=height)
+            self.history_widgets: List[Tuple[Figure, FigureCanvasTkAgg]] = []
             self.height = height
 
-            self.item_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
-            self.SetSizer(self.item_sizer)
+            self.scrolling_canvas = tkinter.Canvas(self, height=height)
+            self.scrolling_canvas.pack(side=tkinter.TOP, fill=tkinter.X, expand=True)
 
-            # self.SetMinSize(wx.Size(0, height))
-            self.SetupScrolling(scroll_x=True, scroll_y=False)
+            self.scrollbar = tkinter.Scrollbar(self, orient=tkinter.HORIZONTAL, command=self.scrolling_canvas.xview)
+            self.scrollbar.pack(side=tkinter.BOTTOM, fill=tkinter.X, expand=False)
+
+            # def _on_canvas_scroll(start, end):
+            #     self.scrolling_canvas.xview(tkinter.SCROLL, 3, 'units')
+            #     self.scrollbar.set(start, end)
+            #     print((start, end))
+
+            self.scrolling_canvas.configure(yscrollcommand=self.scrollbar.set)
+
+            self.scrolling_frame = tkinter.Frame(self.scrolling_canvas)
+            self.scrolling_canvas.create_window((0, 0), window=self.scrolling_frame, anchor='nw')
+            self.scrolling_frame.bind("<Configure>", lambda e: self.scrolling_canvas.configure(scrollregion=self.scrolling_canvas.bbox("all")))
 
             self.active_index = None
 
         def set_active(self, index: int):
-            # if self.active_index is not None:
-            #     self.history_widgets[self.active_index][1].SetWindowStyle(wx.BORDER_SIMPLE)
+            if self.active_index is not None:
+                self.history_widgets[self.active_index][1].get_tk_widget().configure(highlightthickness=0)
 
-            # self.history_widgets[index][1].get_tk_widget().configure(highlightthickness=2, highlightcolor='blue')
+            self.history_widgets[index][1].get_tk_widget().configure(highlightthickness=2, highlightcolor='blue')
             self.active_index = index
 
         def add_entry(self, entry: np.ndarray):
             new_figure = Figure(figsize=(1.5 * self.height / 100, self.height / 100), dpi=100)
             new_figure.gca().plot(np.arange(entry.shape[0]), entry)
 
-            new_canvas = FigureCanvasWxAgg(self, wx.ID_ANY, figure=new_figure)
-            self.item_sizer.Add(new_canvas)
+            new_canvas = FigureCanvasTkAgg(new_figure, master=self.scrolling_frame)
+            new_canvas.get_tk_widget().pack(side=tkinter.LEFT, expand=False, padx=5)
             new_canvas.draw()
 
             def _on_click(event, index=len(self.history_widgets)):
                 print('Setting ' + str(index) + ' to active.')
                 self.set_active(index)
-                wx.PostEvent(self.GetEventHandler(), ActiveItemChangedEvent(index=index))
+                self.event_generate('<<ActiveChanged>>')
 
             new_canvas.mpl_connect('button_release_event', _on_click)
 
             self.history_widgets.append((new_figure, new_canvas))
 
+            self.scrolling_canvas.xview_moveto(1.0 - self.scrolling_canvas.xview()[1])
+            self.scrollbar.set(*self.scrolling_canvas.xview())
+
         def clear_entries(self):
-            self.item_sizer.Clear()
+            for figure, widget in self.history_widgets:
+                widget.get_tk_widget().pack_forget()
+
             self.history_widgets.clear()
             self.active_index = None
 
-    class SampleEditorNativeUIApplication(wx.App):
-        def OnInit(self):
-            self.main_window = wx.Frame(None, wx.ID_ANY, title='Sample Editor')
+    class SampleEditorNativeUIApplication(tkinter.Tk):
+        def __init__(self):
+            super().__init__()
+            self.wm_title("Sample Editor")
 
             wave_graph = Figure(figsize=(5, 4), dpi=100)
 
-            self.active_wave_graph = FigureCanvasWxAgg(self.main_window, wx.ID_ANY, figure=wave_graph)
+            self.active_wave_graph = FigureCanvasTkAgg(wave_graph, master=self)  # A tk.DrawingArea.
             self.active_wave_graph.draw()
 
                 # pack_toolbar=False will make it easier to use a layout manager later on.
-            self.active_wave_toolbar = NavigationToolbar2WxAgg(self.active_wave_graph)
+            self.active_wave_toolbar = NavigationToolbar2Tk(self.active_wave_graph, self, pack_toolbar=False)
             self.active_wave_toolbar.update()
 
             self.active_wave_graph.mpl_connect("key_press_event", key_press_handler)
             self.active_wave_graph.mpl_connect("button_release_event", self._on_active_plot_moved)
 
-            self.history_view = SnapshotHistoryWidget(self.main_window, 100)
-            self.history_view.Bind(EVT_ACTIVE_ITEM_CHANGED, self._on_sample_history_selection)
+            self.history_view = SnapshotHistoryWidget(self, 100)
+            self.history_view.bind('<<ActiveChanged>>', self._on_sample_history_selection)
 
-            self.window_menu = wx.MenuBar()
+            self.window_menu = tkinter.Menu(self)
 
-            self.window_project_menu = wx.Menu()
-            self.main_window.Bind(wx.EVT_MENU, lambda _: self._set_project_folder(), self.window_project_menu.Append(-1, item='Set Project Folder...'))
-            self.window_menu.Append(self.window_project_menu, 'Project')
-            self.window_edit_menu = wx.Menu()
-            self.main_window.Bind(wx.EVT_MENU, lambda _: self._undo_snapshot(), self.window_edit_menu.Append(-1, item='Undo (Use Previous Snapshot)\tCtrl+Z'))
-            self.main_window.Bind(wx.EVT_MENU, lambda _: self._redo_snapshot(), self.window_edit_menu.Append(-1, item='Redo (Use Next Snapshot)\tCtrl+Y'))
-            self.window_menu.Append(self.window_edit_menu, 'Edit')
-            self.main_window.SetMenuBar(self.window_menu)
+            self.window_project_menu = tkinter.Menu(self)
+            self.window_project_menu.add_command(label='Set Project Folder...', command=self._set_project_folder)
+            self.window_menu.add_cascade(label='Project', menu=self.window_project_menu)
+            self.window_edit_menu = tkinter.Menu(self)
+            self.window_edit_menu.add_command(label='Undo (Use Previous Snapshot)', command=self._undo_snapshot, accelerator='Ctrl+Z')
+            self.window_edit_menu.add_command(label='Redo (Use Next Snapshot)', command=self._redo_snapshot, accelerator='Ctrl+Y')
+            self.window_menu.add_cascade(label='Edit', menu=self.window_edit_menu)
+            self.configure(menu=self.window_menu)
 
-            self.main_window_sizer = wx.BoxSizer(orient=wx.VERTICAL)
-            self.main_window_sizer.Add(self.active_wave_graph, wx.SizerFlags(proportion=1).Expand())
-            self.main_window_sizer.Add(self.active_wave_toolbar, wx.SizerFlags().Expand())
-            self.main_window_sizer.Add(self.history_view, wx.SizerFlags().Expand())
-            self.main_window.SetSizerAndFit(self.main_window_sizer)
+            self.history_view.pack(side=tkinter.BOTTOM, fill=tkinter.X)
+            self.active_wave_toolbar.pack(side=tkinter.BOTTOM, fill=tkinter.X)
+            self.active_wave_graph.get_tk_widget().pack(side=tkinter.TOP, fill=tkinter.BOTH, expand=True)
 
             self.sample_snapshots = []
             self.active_snapshot_index = None
@@ -122,15 +136,11 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.queue_pump_thread = threading.Thread(target=self._invoke_synth_handlers, name='Queue Pump Thread')
             self.queue_pump_thread.start()
 
-            self.SetTopWindow(self.main_window)
-            self.main_window.Show()
-
-            return True
 
         def _invoke_synth_handlers(self):
             while True:
                 event_data = ui_process_recv_queue.get()
-                wx.CallAfter(self.synth_handlers[event_data[0]], *event_data[1:])
+                self.after('idle', self.synth_handlers[event_data[0]], *event_data[1:])
 
         def _plot_sample(self, sample: np.ndarray):
             if self.wave_axes is None:
@@ -175,11 +185,10 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 self.history_view.set_active(self.active_snapshot_index)
 
         def _set_project_folder(self):
-            folder_dialog = wx.DirDialog(parent=self.main_window, message='Select a project folder')
-            result = folder_dialog.ShowModal()
+            dialog_result = tkinter.filedialog.askdirectory()
 
-            if result == wx.ID_OK:
-                current_project_folder = pathlib.Path(folder_dialog.GetPath())
+            if dialog_result is not None and dialog_result != () and dialog_result != '':
+                current_project_folder = pathlib.Path(dialog_result)
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_PROJECT_FOLDER, current_project_folder))
 
                 print('Current project folder set to ' + str(current_project_folder))
@@ -243,7 +252,7 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
     # wave_anim.resume()
 
     application = SampleEditorNativeUIApplication()
-    application.MainLoop()
+    tkinter.mainloop()
 
 class SampleEditorNativeUI:
     def __init__(self):

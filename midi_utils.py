@@ -89,7 +89,7 @@ class VirtualKeyboard(midi.Input):
     def process_key(self, key: str):
         charmap = {'a': 0, 'w': 1,  's': 2,  'e': 3,  'd': 4, 'f': 5, 't': 6, 'g': 7, 'y': 8,
                             'h': 9, 'u': 10, 'j': 11, 'i': 12, 'k': 13, 'l': 14}
-        fixed_key_charmap = {'z': 82 + 20, 'x': 83 + 20, 'c': 84 + 20, 'v': 85 + 20, '': 86 + 20, 'n': 87 + 20, 'm': 88 + 20}
+        fixed_key_charmap = {'z': 77 + 20, 'x': 78 + 20, 'c': 79 + 20, 'v': 80 + 20, 'b': 81 + 20, 'n': 82 + 20, 'm': 83 + 20, ',': 84 + 20, '.': 85 + 20, '/': 86 + 20, ';': 87 + 20, '\'': 88 + 20}
             
         if key in charmap or key in fixed_key_charmap:
             MSG_ENUM = MIDIMessage.STATUS_MESSAGE_TYPE

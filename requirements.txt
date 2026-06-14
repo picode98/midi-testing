@@ -3,3 +3,4 @@ sounddevice
 matplotlib
 pygame
 pywebview
+wxPython
