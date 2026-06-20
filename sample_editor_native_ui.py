@@ -5,7 +5,10 @@ import queue
 import numpy as np
 from enum import StrEnum
 
-from typing import List, Tuple
+from sample_editor_effect import EffectSettings, SampleEffect
+
+from typing import List, Tuple, Dict, Optional
+
 
 class IncomingMessageType(StrEnum):
     SET_SAMPLE = 'set_sample'
@@ -15,8 +18,16 @@ class OutgoingMessageType(StrEnum):
     SET_PROJECT_FOLDER = 'set_project_folder'
     SET_EDIT_WINDOW = 'set_edit_window'
     SET_ACTIVE_SNAPSHOT = 'set_active_snapshot'
+    SET_EFFECT_SETTING_VALUE = 'set_effect_setting_value'
+    SET_SAMPLE_SIZE = 'set_sample_size'
+    APPLICATION_EXIT = 'application_exit'
 
-def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_process_recv_queue: multiprocessing.Queue):
+class WavelengthAddMode(StrEnum):
+    ADD_SINE_WAVE = 'add_sine_wave'
+    ADD_SILENCE = 'add_silence'
+    ADD_LOOP = 'add_loop'
+
+def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_process_recv_queue: multiprocessing.Queue, effect_settings_info: Dict[str, Dict[str, EffectSettings]], initial_setting_values: Dict[str, Dict[str, int | float | str]]):
     import wx
     import wx.lib.newevent
     import wx.lib.scrolledpanel
@@ -75,6 +86,48 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.history_widgets.clear()
             self.active_index = None
 
+    class ModifyNumWavelengthsDialog(wx.Dialog):
+        def __init__(self, parent, current_wavelengths: int):
+            super().__init__(parent, wx.ID_ANY, title='Modify Wavelengths')
+
+            self.result_wavelengths: Optional[int] = None
+            self.result_add_mode: Optional[WavelengthAddMode] = None
+
+            self.form_sizer = wx.GridSizer(cols=2, gap=wx.Size(5, 5))
+            self.form_sizer.Add(wx.StaticText(self, wx.ID_ANY, 'Number of wavelengths:'))
+            self.num_wavelengths_entry = wx.SpinCtrl(self, wx.ID_ANY, initial=current_wavelengths, min=1, max=(2 ** 31 - 1))
+            self.form_sizer.Add(self.num_wavelengths_entry)
+            self.form_sizer.Add(wx.StaticText(self, wx.ID_ANY, 'Fill additional wavelengths with:'))
+            self.fill_option_sine_button = wx.RadioButton(self, wx.ID_ANY, label='Sine wave', style=wx.RB_GROUP)
+            self.fill_option_silence_button = wx.RadioButton(self, wx.ID_ANY, label='Silence')
+            self.fill_option_silence_button.SetValue(True)
+            self.fill_option_loop_button = wx.RadioButton(self, wx.ID_ANY, label='Loop of the current sample')
+            self.form_sizer.Add(self.fill_option_sine_button)
+            self.form_sizer.Add(wx.Size(0, 0))
+            self.form_sizer.Add(self.fill_option_silence_button)
+            self.form_sizer.Add(wx.Size(0, 0))
+            self.form_sizer.Add(self.fill_option_loop_button)
+
+            self.main_sizer = wx.BoxSizer(orient=wx.VERTICAL)
+            self.btn_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
+            self.ok_btn = wx.Button(self, wx.ID_OK, label='OK')
+            self.ok_btn.Bind(wx.EVT_BUTTON, self._on_OK_click)
+            self.cancel_btn = wx.Button(self, wx.ID_CANCEL, label='Cancel')
+            self.cancel_btn.Bind(wx.EVT_BUTTON, lambda event: self.EndModal(wx.ID_CANCEL))
+            self.btn_sizer.AddStretchSpacer(prop=1)
+            self.btn_sizer.Add(self.ok_btn)
+            self.btn_sizer.AddSpacer(5)
+            self.btn_sizer.Add(self.cancel_btn)
+
+            self.main_sizer.Add(self.form_sizer, wx.SizerFlags().Expand().Border(wx.ALL, 5))
+            self.main_sizer.Add(self.btn_sizer, wx.SizerFlags().Expand().Border(wx.ALL, 5))
+            self.SetSizerAndFit(self.main_sizer)
+
+        def _on_OK_click(self, event):
+            self.result_wavelengths = self.num_wavelengths_entry.GetValue()
+            self.result_add_mode = (WavelengthAddMode.ADD_SINE_WAVE if self.fill_option_sine_button.GetValue() else (WavelengthAddMode.ADD_SILENCE if self.fill_option_silence_button.GetValue() else WavelengthAddMode.ADD_LOOP))
+            self.EndModal(wx.ID_OK)
+
     class SampleEditorNativeUIApplication(wx.App):
         def OnInit(self):
             self.main_window = wx.Frame(None, wx.ID_ANY, title='Sample Editor')
@@ -87,6 +140,19 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 # pack_toolbar=False will make it easier to use a layout manager later on.
             self.active_wave_toolbar = NavigationToolbar2WxAgg(self.active_wave_graph)
             self.active_wave_toolbar.update()
+
+            self.active_wave_last_drawn_num_wavelengths = None
+            self.active_wave_last_drawn_sample_length = None
+
+            self.bottom_toolbar_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
+            self.active_wave_num_wavelengths_text = wx.StaticText(self.main_window, wx.ID_ANY, label='[unknown] wavelengths')
+            self.active_wave_modify_wavelengths_button = wx.Button(self.main_window, wx.ID_ANY, label='Modify...')
+            self.active_wave_modify_wavelengths_button.Bind(wx.EVT_BUTTON, self._on_num_wavelengths_button_click)
+
+            self.bottom_toolbar_sizer.Add(self.active_wave_toolbar, proportion=1)
+            self.bottom_toolbar_sizer.Add(self.active_wave_num_wavelengths_text, wx.SizerFlags().CenterVertical())
+            self.bottom_toolbar_sizer.AddSpacer(5)
+            self.bottom_toolbar_sizer.Add(self.active_wave_modify_wavelengths_button, wx.SizerFlags().CenterVertical())
 
             self.active_wave_graph.mpl_connect("key_press_event", key_press_handler)
             self.active_wave_graph.mpl_connect("button_release_event", self._on_active_plot_moved)
@@ -105,18 +171,49 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.window_menu.Append(self.window_edit_menu, 'Edit')
             self.main_window.SetMenuBar(self.window_menu)
 
-            self.main_window_sizer = wx.BoxSizer(orient=wx.VERTICAL)
-            self.main_window_sizer.Add(self.active_wave_graph, wx.SizerFlags(proportion=1).Expand())
-            self.main_window_sizer.Add(self.active_wave_toolbar, wx.SizerFlags().Expand())
-            self.main_window_sizer.Add(self.history_view, wx.SizerFlags().Expand())
+            self.sample_view_sizer = wx.BoxSizer(orient=wx.VERTICAL)
+            self.sample_view_sizer.Add(self.active_wave_graph, wx.SizerFlags(proportion=1).Expand())
+            self.sample_view_sizer.Add(self.bottom_toolbar_sizer, wx.SizerFlags().Expand())
+            self.sample_view_sizer.Add(self.history_view, wx.SizerFlags().Expand())
+
+            self.effect_setting_controls: Dict[str, Dict[str, wx.TextCtrl | wx.SpinCtrl | wx.SpinCtrlDouble]] = dict()
+            self.effect_settings_container = wx.Notebook(self.main_window, wx.ID_ANY)
+            for effect_name, effect_settings in sorted(effect_settings_info.items(), key=lambda x: x[0]):
+                new_page = wx.NotebookPage(self.effect_settings_container, wx.ID_ANY)
+                new_page_sizer = wx.GridSizer(2, wx.Size(5, 5))
+
+                self.effect_setting_controls[effect_name] = dict()
+                for setting_key, setting in sorted(effect_settings.items(), key=lambda x: x[1].setting_name):
+                    new_page_sizer.Add(wx.StaticText(new_page, wx.ID_ANY, setting.setting_name))
+                    if setting.data_type == int:
+                        text_input = wx.SpinCtrl(new_page, wx.ID_ANY, initial=initial_setting_values[effect_name][setting_key], min=(1 - 2 ** 31 if setting.range_min is None else setting.range_min),
+                                                 max=(2 ** 31 if setting.range_max is None else setting.range_max))
+                    elif setting.data_type == float:
+                        text_input = wx.SpinCtrlDouble(new_page, wx.ID_ANY, initial=initial_setting_values[effect_name][setting_key], min=(1 - 2 ** 31 if setting.range_min is None else setting.range_min),
+                                                       max=(2 ** 31 if setting.range_max is None else setting.range_max))
+                    else:
+                        text_input = wx.TextCtrl(new_page, wx.ID_ANY, initial_setting_values[effect_name][setting_key])
+
+                    text_input.Bind(wx.EVT_TEXT, lambda event, input_ctl=text_input, effect_name=effect_name, setting_key=setting_key: self._on_effect_setting_changed(input_ctl, effect_name, setting_key))
+                    new_page_sizer.Add(text_input)
+                    self.effect_setting_controls[effect_name][setting_key] = text_input
+
+                new_page.SetSizerAndFit(new_page_sizer)
+                self.effect_settings_container.AddPage(new_page, effect_name)
+
+            self.main_window_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
+            self.main_window_sizer.Add(self.sample_view_sizer, wx.SizerFlags(proportion=1).Expand())
+            self.main_window_sizer.Add(self.effect_settings_container, wx.SizerFlags(proportion=1).Expand())
             self.main_window.SetSizerAndFit(self.main_window_sizer)
 
-            self.sample_snapshots = []
-            self.active_snapshot_index = None
+            self.sample_snapshots: List[Tuple[np.ndarray, int]] = []
+            self.active_snapshot_index: Optional[int] = None
 
             self.wave_axes = None
             self.wave_artist = None
             self.existing_x_bounds = None
+            
+            self.application_exiting = False
 
             self.synth_handlers = {IncomingMessageType.LOAD_PROJECT_DATA: self._on_project_load, IncomingMessageType.SET_SAMPLE: self._on_sample_set}
             self.queue_pump_thread = threading.Thread(target=self._invoke_synth_handlers, name='Queue Pump Thread')
@@ -126,37 +223,71 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.main_window.Show()
 
             return True
+        
+        def OnExit(self) -> int:
+            self.application_exiting = True
+            ui_process_recv_queue.put_nowait(None)
+            ui_process_send_queue.put_nowait((OutgoingMessageType.APPLICATION_EXIT,))
+            self.queue_pump_thread.join()
+
+            return 0           
 
         def _invoke_synth_handlers(self):
             while True:
                 event_data = ui_process_recv_queue.get()
+
+                if self.application_exiting:
+                    return
+                
                 wx.CallAfter(self.synth_handlers[event_data[0]], *event_data[1:])
 
-        def _plot_sample(self, sample: np.ndarray):
-            if self.wave_axes is None:
+        def _plot_sample(self, sample: np.ndarray, num_wavelengths: int):
+            if self.wave_axes is None or num_wavelengths != self.active_wave_last_drawn_num_wavelengths or len(sample) != self.active_wave_last_drawn_sample_length:
                 self.wave_axes = self.active_wave_graph.figure.gca()
+                self.wave_axes.clear()
                 self.wave_artist = self.wave_axes.plot(np.arange(sample.shape[0]), sample)[0]
+                self.wave_axes.set_xticks(np.linspace(0, len(sample), num_wavelengths + 1), [str(x) for x in range(num_wavelengths + 1)])
+                self.wave_axes.grid(visible=True, which='major', axis='x')
+
                 new_x_bound_min, new_x_bound_max = self.wave_axes.get_xbound()
                 self.existing_x_bounds = (int(round(new_x_bound_min)), int(round(new_x_bound_max)))
+
+                self.active_wave_last_drawn_num_wavelengths = num_wavelengths
+                self.active_wave_last_drawn_sample_length = len(sample)
 
             self.wave_artist.set_ydata(sample)
             self.active_wave_graph.draw()
 
-        def _on_project_load(self, project_samples: List[np.ndarray]):
+            self.active_wave_num_wavelengths_text.SetLabelText(str(num_wavelengths) + (' wavelengths' if num_wavelengths != 1 else ' wavelength'))
+
+        def _on_project_load(self, project_samples: List[Tuple[np.ndarray, int]], project_effect_settings: Dict[str, Dict[str, int | float | str]]):
             self.sample_snapshots = project_samples
             self.active_snapshot_index = len(project_samples) - 1
-            self._plot_sample(self.sample_snapshots[self.active_snapshot_index])
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
 
             self.history_view.clear_entries()
-            for sample in self.sample_snapshots:
+            for sample, _ in self.sample_snapshots:
                 self.history_view.add_entry(sample)
 
             self.history_view.set_active(self.active_snapshot_index)
 
+            for effect_name, effect_settings in project_effect_settings.items():
+                if effect_name in self.effect_setting_controls:
+                    for setting_key, setting_value in project_effect_settings[effect_name].items():
+                        if setting_key in self.effect_setting_controls[effect_name]:
+                            self.effect_setting_controls[effect_name][setting_key].SetValue(setting_value)
+
+        def _on_num_wavelengths_button_click(self, event):
+            dialog = ModifyNumWavelengthsDialog(self.main_window, self.sample_snapshots[self.active_snapshot_index][1])
+            dialog.ShowModal()
+            if dialog.result_wavelengths is not None:
+                ui_process_send_queue.put_nowait((OutgoingMessageType.SET_SAMPLE_SIZE, dialog.result_wavelengths, dialog.result_add_mode))
+
         def _on_sample_history_selection(self, event):
             self.active_snapshot_index = self.history_view.active_index
+            assert self.active_snapshot_index is not None
             ui_process_send_queue.put_nowait((OutgoingMessageType.SET_ACTIVE_SNAPSHOT, self.active_snapshot_index))
-            self._plot_sample(self.sample_snapshots[self.active_snapshot_index])
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
 
         def _on_active_plot_moved(self, event):
             new_x_bound_min, new_x_bound_max = self.wave_axes.get_xbound()
@@ -165,14 +296,31 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 self.existing_x_bounds = new_x_bounds
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_EDIT_WINDOW, self.existing_x_bounds))
 
-        def _on_sample_set(self, new_sample: np.ndarray, is_checkpoint: bool):
-            self._plot_sample(new_sample)
+        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool):
+            self._plot_sample(new_sample, num_wavelengths)
 
             if is_checkpoint:
-                self.sample_snapshots.append(new_sample)
+                self.sample_snapshots.append((new_sample, num_wavelengths))
                 self.active_snapshot_index = len(self.sample_snapshots) - 1
                 self.history_view.add_entry(new_sample)
                 self.history_view.set_active(self.active_snapshot_index)
+
+        def _on_effect_setting_changed(self, input_ctl: wx.TextCtrl, effect_name: str, setting_key: str):
+            text_value = input_ctl.GetTextValue()
+            settings = effect_settings_info[effect_name][setting_key]
+
+            if len(text_value) > 0:
+                try:
+                    if settings.data_type == int:
+                        new_value = int(text_value)
+                    elif settings.data_type == float:
+                        new_value = float(text_value)
+                    else:
+                        new_value = text_value
+
+                    ui_process_send_queue.put_nowait((OutgoingMessageType.SET_EFFECT_SETTING_VALUE, effect_name, setting_key, new_value))
+                except ValueError:
+                    print('Invalid numeric value "' + text_value + '" for setting ' + setting_key + ' of effect ' + effect_name + '.')
 
         def _set_project_folder(self):
             folder_dialog = wx.DirDialog(parent=self.main_window, message='Select a project folder')
@@ -188,14 +336,14 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             if self.active_snapshot_index is not None and self.active_snapshot_index >= 1:
                 self.active_snapshot_index -= 1
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_ACTIVE_SNAPSHOT, self.active_snapshot_index))
-                self._plot_sample(self.sample_snapshots[self.active_snapshot_index])
+                self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
                 self.history_view.set_active(self.active_snapshot_index)
 
         def _redo_snapshot(self):
             if self.active_snapshot_index is not None and self.active_snapshot_index < len(self.sample_snapshots) - 1:
                 self.active_snapshot_index += 1
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_ACTIVE_SNAPSHOT, self.active_snapshot_index))
-                self._plot_sample(self.sample_snapshots[self.active_snapshot_index])
+                self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
                 self.history_view.set_active(self.active_snapshot_index)
 
     # root = tkinter.Tk()
@@ -246,17 +394,17 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
     application.MainLoop()
 
 class SampleEditorNativeUI:
-    def __init__(self):
+    def __init__(self, effect_settings_info: Dict[str, Dict[str, EffectSettings]], initial_setting_values: Dict[str, Dict[str, int | float | str]]):
         self.ui_process_send_queue = multiprocessing.Queue()
         self.ui_process_recv_queue = multiprocessing.Queue()
-        self.vis_process = multiprocessing.Process(target=_visualization_worker, args=(self.ui_process_send_queue, self.ui_process_recv_queue))
+        self.vis_process = multiprocessing.Process(target=_visualization_worker, args=(self.ui_process_send_queue, self.ui_process_recv_queue, effect_settings_info, initial_setting_values))
         self.vis_process.start()
 
-    def load_project_data(self, project_samples: List[np.ndarray]):
-        self.ui_process_recv_queue.put_nowait((IncomingMessageType.LOAD_PROJECT_DATA, project_samples))
+    def load_project_data(self, project_samples: List[Tuple[np.ndarray, int]], project_setting_values: Dict[str, Dict[str, int | float | str]]):
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.LOAD_PROJECT_DATA, project_samples, project_setting_values))
 
-    def update_current_sample(self, sample: np.ndarray, is_checkpoint: bool, checkpoint_desc: str):
-        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, is_checkpoint))
+    def update_current_sample(self, sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str):
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, is_checkpoint))
 
     def get_events(self):
         try:

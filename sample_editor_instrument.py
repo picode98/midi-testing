@@ -1,14 +1,17 @@
+import dataclasses
 from math import pi
 from abc import ABC
 from collections import OrderedDict
 import pathlib
 import json
-from typing import List
+from typing import Type
 
 import numpy as np
 from pygame import midi
+import dataclasses_json
 # import resampy
 
+from sample_editor_effect import EffectSettings, SampleEffect
 from midi_utils import *
 from midi_utils import KeyOffMessage, KeyOnMessage, np
 from utils import CustomOsc, Fadeable, read_wav_file, write_wav_file
@@ -51,17 +54,17 @@ class SampleRepeatingOsc(CustomOsc):
         resampled_buf = np.interp(frame_indices, np.arange(self.sample_buf.shape[0]), self.sample_buf)
         return np.transpose(np.tile(self.amplitude * resampled_buf, (2, 1)))
 
-class SampleEffect(ABC):
-    def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
-        raise NotImplementedError()
-
 class TremoloEffect(SampleEffect):
     def __init__(self, wavelength: float):
+        super().__init__()
         self.wavelength = wavelength
 
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
         multipliers = np.sin(2.0 * np.pi * np.arange(len(sample_slice)) / self.wavelength) * (0.002 * magnitude) + (1.0 - (0.002 * magnitude))
         sample_slice *= multipliers
+
+    def get_settings(self):
+        return {**super().get_settings(), 'wavelength': EffectSettings('Wavelength', float, 0.0, None)}
 
 class PowerFadeEffect(SampleEffect):
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
@@ -83,6 +86,7 @@ class SimpleDistortEffect(SampleEffect):
 
 class FractionalWavelengthEffect(SampleEffect):
     def __init__(self, multiple: int):
+        super().__init__()
         self.multiple = multiple
 
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
@@ -90,20 +94,35 @@ class FractionalWavelengthEffect(SampleEffect):
         for i in range(0, len(interpolated), len(sample_slice)):
             sample_slice += interpolated[i:i + len(sample_slice)] * magnitude / 100.0
 
+    def get_settings(self):
+        return {**super().get_settings(), 'multiple': EffectSettings('Wavelength multiple', int, 2, 20)}
+
 class SmoothingEffect(SampleEffect):
+    def __init__(self, window_size: int):
+        super().__init__()
+        self.window_size = window_size
+
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
-        num_frames = 5
-        smoothing_term = sample_slice * magnitude / (100.0 * num_frames)
+        smoothing_term = sample_slice * magnitude / (100.0 * self.window_size)
         sample_slice *= 1.0 - magnitude / 100.0
         idx_range = np.arange(sample_slice.shape[0])
-        for i in range(1, num_frames + 1):
+        for i in range(1, self.window_size + 1):
             sample_slice += smoothing_term[(idx_range + i * 5) % sample_slice.shape[0]]
 
+    def get_settings(self):
+        return {**super().get_settings(), 'window_size': EffectSettings('Window size', int, 0, 100)}
+
 class QuantizeEffect(SampleEffect):
+    def __init__(self, factor: float):
+        super().__init__()
+        self.factor = factor
+
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
-        factor = 20.0
-        rounded_values = np.round(sample_slice * factor) / factor
+        rounded_values = np.round(sample_slice * self.factor) / self.factor
         sample_slice -= (sample_slice - rounded_values) * (magnitude / 100.0)
+
+    def get_settings(self):
+        return {**super().get_settings(), 'factor': EffectSettings('Quantization factor', float, 1.0, None)}
 
 class NoiseEffect(SampleEffect):
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
@@ -122,27 +141,42 @@ class NonDistortingAmplifyEffect(SampleEffect):
 
 class MixWithStaticSampleEffect(SampleEffect):
     def __init__(self, mix_sample: np.ndarray):
+        super().__init__()
         self.mix_sample = mix_sample
 
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
         sample_slice[:] = sample_slice * (1.0 - magnitude / 100.0) + self.mix_sample[slice_offset:slice_offset + len(sample_slice)] * (magnitude / 100.0)
 
+@dataclasses.dataclass
+class SampleEditorSnapshot(dataclasses_json.DataClassJsonMixin):
+    path: str
+    num_wavelengths: int
+
+@dataclasses.dataclass
+class SampleEditorProjectSettings(dataclasses_json.DataClassJsonMixin):
+    snapshots: List[SampleEditorSnapshot] = dataclasses.field(default_factory=lambda: [])
+    effect_setting_values: Dict[str, Dict[str, int | float | str]] = dataclasses.field(default_factory=lambda: dict())
+
 class SampleEditorProjectManager:
     def __init__(self):
-        self.project_folder = None
-        self.snapshots = []
+        self.project_folder: Optional[pathlib.Path] = None
+        self.settings = SampleEditorProjectSettings()
+        self.snapshot_data = []
 
-    def append_snapshot(self, sample_data: np.ndarray):
-        self.snapshots.append((f'{len(self.snapshots) + 1:05d}.wav', sample_data.copy()))
+    def append_snapshot(self, sample_data: np.ndarray, num_wavelengths: int):
+        new_snapshot_path = f'{len(self.snapshot_data) + 1:05d}.wav'
+        self.snapshot_data.append((new_snapshot_path, sample_data.copy()))
+        self.settings.snapshots.append(SampleEditorSnapshot(new_snapshot_path, num_wavelengths))
 
     def write_project(self):
+        assert self.project_folder is not None
         self.project_folder.mkdir(exist_ok=True)
 
-        proj_data_obj = {'snapshots': [rel_path for rel_path, sample_data in self.snapshots]}
+        proj_data_obj = self.settings.to_dict()
         with (self.project_folder / 'project.json').open('w') as proj_file:
             json.dump(proj_data_obj, proj_file)
 
-        for rel_path, sample_data in self.snapshots:
+        for rel_path, sample_data in self.snapshot_data:
             try:
                 with (self.project_folder / rel_path).open('xb') as created_data_file:
                     write_wav_file(created_data_file, sample_data)
@@ -159,20 +193,23 @@ class SampleEditorProjectManager:
             self.write_project()
             return
         
-        self.snapshots: List[Tuple[str, np.ndarray]] = []
-        for sample_data_path in proj_data['snapshots']:
-            frames, sample_rate = read_wav_file(str(self.project_folder / sample_data_path))
-            self.snapshots.append((sample_data_path, frames))
+        self.settings = SampleEditorProjectSettings.from_dict(proj_data)
+        
+        self.snapshot_data: List[Tuple[str, np.ndarray]] = []
+        for snapshot in self.settings.snapshots:
+            frames, sample_rate = read_wav_file(str(self.project_folder / snapshot.path))
+            self.snapshot_data.append((snapshot.path, frames))
 
 
 
 
 
 class SampleEditorSynth(CustomSynth):
-    def __init__(self, num_wavelengths: int, bank_switch_key: int, effect_map: List[Dict[int, SampleEffect]], sample_size: int = 4410):
+    def __init__(self, num_wavelengths: int, bank_switch_key: int, effect_map: List[Dict[int, SampleEffect]], sample_resolution: int = 1000):
         super().__init__(output=sd.OutputStream(device=0, samplerate=44100, latency=0.05))
-        self.master_sample = np.sin(np.linspace(0.0, num_wavelengths * (2.0 * pi), sample_size))
+        self.master_sample = np.sin(np.linspace(0.0, num_wavelengths * (2.0 * pi), num_wavelengths * sample_resolution))
         self.master_sample_wavelengths = num_wavelengths
+        self.sample_resolution = sample_resolution
         self.effect_map = effect_map
         self.applying_effects = False
         self.current_effects: OrderedDict[int, Tuple[SampleEffect, float]] = OrderedDict()
@@ -227,6 +264,31 @@ class SampleEditorSynth(CustomSynth):
 
     def set_edit_params(self, min_sample: int, max_sample: int):
         self.edit_min_sample, self.edit_max_sample = max(min(min_sample, len(self.master_sample)), 0), max(min(max_sample, len(self.master_sample)), 0)
+    
+    def set_master_sample(self, new_sample: np.ndarray, new_num_wavelengths: int):
+        self.master_sample_wavelengths = new_num_wavelengths
+
+        self.master_sample = new_sample
+        for osc_list in self.active_oscs.values():
+            for osc in osc_list:
+                osc.sample_buf = self.master_sample
+                if osc.sample_offset >= len(self.master_sample):
+                    osc.sample_offset = 0
+
+    def resize_sample(self, new_num_wavelengths: int, add_mode: sample_editor_native_ui.WavelengthAddMode):
+        new_sample = np.resize(self.master_sample, (new_num_wavelengths * self.sample_resolution,))
+
+        if len(new_sample) > len(self.master_sample):
+            # Looping occurs by default; we only need to considers the other modes
+            if add_mode == sample_editor_native_ui.WavelengthAddMode.ADD_SILENCE:
+                new_sample[len(self.master_sample):] = 0.0
+            elif add_mode == sample_editor_native_ui.WavelengthAddMode.ADD_SINE_WAVE:
+                sine_points = np.sin(np.linspace(-2.0 * np.pi * (len(new_sample) - len(self.master_sample)) / self.sample_resolution, 0.0, len(new_sample) - len(self.master_sample)))
+                new_sample[len(self.master_sample):] = sine_points
+
+        self.set_master_sample(new_sample, new_num_wavelengths)
+
+            
 
 
 # def visualization_worker(wave_queue: mp.Queue, edit_params_queue: mp.Queue):
@@ -274,20 +336,25 @@ if __name__ == '__main__':
                                            80 + 20: MixWithStaticSampleEffect(triangle_waveform(80, 88200)),
                                            81 + 20: MixWithStaticSampleEffect(sawtooth_waveform(80, 88200)),
                                            82 + 20: MixWithStaticSampleEffect(sine_waveform(80, 88200))},
-                                          {79 + 20: TremoloEffect(10000.0),
-                                           80 + 20: FractionalWavelengthEffect(2),
-                                           81 + 20: FractionalWavelengthEffect(3),
-                                           82 + 20: FractionalWavelengthEffect(5),
-                                           83 + 20: NoiseEffect(), 84 + 20: QuantizeEffect(),
+                                          {81 + 20: TremoloEffect(10000.0),
+                                           82 + 20: FractionalWavelengthEffect(2),
+                                           83 + 20: NoiseEffect(), 84 + 20: QuantizeEffect(20.0),
                                            85 + 20: PowerFadeEffect(),
                                            86 + 20: PowerStrengthenEffect(),
                                            87 + 20: SimpleDistortEffect(),
-                                           88 + 20: SmoothingEffect()}], sample_size=88200)
+                                           88 + 20: SmoothingEffect(5)}], sample_resolution=1000)
 
     proj_manager = SampleEditorProjectManager()
+    proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths)
     # wave_queue = mp.Queue()
     # edit_params_queue = mp.Queue()
-    editor_ui = sample_editor_native_ui.SampleEditorNativeUI()
+    effects_by_type = {type(effect).__name__: effect for bank_map in synth.effect_map for effect in bank_map.values()}
+    all_settings_info = {effect_type: effect.get_settings() for effect_type, effect in effects_by_type.items()}
+    initial_setting_values = {effect_type: {setting_key: getattr(effects_by_type[effect_type], setting_key) for setting_key in effect_settings.keys()} for effect_type, effect_settings in all_settings_info.items()}
+    proj_manager.settings.effect_setting_values = initial_setting_values
+
+    editor_ui = sample_editor_native_ui.SampleEditorNativeUI(all_settings_info, initial_setting_values)
+    editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, True, 'Default sine-wave sample')
     # vis_process = mp.Process(target=visualization_worker, args=(wave_queue, edit_params_queue))
     # vis_process.start()
     i = 0
@@ -298,25 +365,40 @@ if __name__ == '__main__':
             if event[0] == sample_editor_native_ui.OutgoingMessageType.SET_PROJECT_FOLDER:
                 _, new_folder = event
                 proj_manager.set_project_folder(new_folder)
-                if len(proj_manager.snapshots) > 0:
-                    synth.master_sample[:] = proj_manager.snapshots[-1][1]
-                editor_ui.load_project_data([sample_data for file_path, sample_data in proj_manager.snapshots])
+                if len(proj_manager.snapshot_data) > 0:
+                    synth.set_master_sample(proj_manager.snapshot_data[-1][1].copy(), proj_manager.settings.snapshots[-1].num_wavelengths)
+
+                for effect_name, effect_settings in proj_manager.settings.effect_setting_values.items():
+                    for setting_key, setting_value in effect_settings.items():
+                        setattr(effects_by_type[effect_name], setting_key, setting_value)
+
+                editor_ui.load_project_data([(sample_data, metadata.num_wavelengths) for (file_path, sample_data), metadata in zip(proj_manager.snapshot_data, proj_manager.settings.snapshots)], proj_manager.settings.effect_setting_values)
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_EDIT_WINDOW:
                 _, (new_lbound, new_hbound) = event
                 print(event)
                 synth.set_edit_params(new_lbound, new_hbound)
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_ACTIVE_SNAPSHOT:
                 _, snapshot_index = event
-                synth.master_sample[:] = proj_manager.snapshots[snapshot_index][1]
+                synth.set_master_sample(proj_manager.snapshot_data[snapshot_index][1].copy(), proj_manager.settings.snapshots[snapshot_index].num_wavelengths)
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_EFFECT_SETTING_VALUE:
+                _, effect_type_name, setting_key, new_value = event
+                setattr(effects_by_type[effect_type_name], setting_key, new_value)
+                print(setting_key + ' for ' + effect_type_name + ' was changed to ' + str(new_value) + '.')
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_SAMPLE_SIZE:
+                _, new_wavelengths, add_mode = event
+                synth.resize_sample(new_wavelengths, add_mode)
+                is_checkpoint = True
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.APPLICATION_EXIT:
+                exit(0)
 
 
         if is_checkpoint:
-            proj_manager.append_snapshot(synth.master_sample)
+            proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths)
             if proj_manager.project_folder is not None:
                 proj_manager.write_project()
 
         if is_checkpoint or i % 10000 == 0:
-            editor_ui.update_current_sample(synth.master_sample, is_checkpoint, '')
+            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, is_checkpoint, '')
             # wave_queue.put(synth.master_sample)
 
             # new_edit_params = None
