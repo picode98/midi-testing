@@ -7,6 +7,15 @@ import pygame.mouse
 import numpy as np
 import math
 
+def sentence_from_list(items):
+    if len(items) == 0:
+        return ''
+    elif len(items) == 1:
+        return str(items[0])
+    elif len(items) == 2:
+        return f'{items[0]} and {items[1]}'
+    else:
+        return f'{", ".join(items[:-1])}, and {items[-1]}'
 
 def get_note_frequency(octave: int, note: str):
     NOTES = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#']

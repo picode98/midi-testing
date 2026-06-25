@@ -15,7 +15,7 @@ class SampleEffect(ABC):
     def __init__(self):
         self.sensitivity = 1.0
 
-    def apply_step(self, sample_slice: np.ndarray, slice_offset: int, magnitude: float):
+    def apply_step(self, sample_slice: np.ndarray, slice_offset: int, resolution: int, magnitude: float):
         raise NotImplementedError()
 
     def get_settings(self) -> Dict[str, EffectSettings]:

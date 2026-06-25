@@ -64,12 +64,21 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             # self.history_widgets[index][1].get_tk_widget().configure(highlightthickness=2, highlightcolor='blue')
             self.active_index = index
 
-        def add_entry(self, entry: np.ndarray):
+        def add_entry(self, sample: np.ndarray, sample_desc: str):
             new_figure = Figure(figsize=(1.5 * self.height / 100, self.height / 100), dpi=100)
-            new_figure.gca().plot(np.arange(entry.shape[0]), entry)
+            new_axes = new_figure.gca()
+            new_axes.set_axis_off()
+            new_axes.plot(np.arange(sample.shape[0]), sample)
+
+            desc_text = wx.StaticText(self, wx.ID_ANY, label=sample_desc, style=wx.ALIGN_CENTRE_HORIZONTAL)
+            desc_text.Wrap(int(1.5 * self.height))
+
+            item_label_sizer = wx.BoxSizer(orient=wx.VERTICAL)
+            item_label_sizer.Add(desc_text, wx.SizerFlags().Align(wx.CENTER))
 
             new_canvas = FigureCanvasWxAgg(self, wx.ID_ANY, figure=new_figure)
-            self.item_sizer.Add(new_canvas)
+            item_label_sizer.Add(new_canvas)
+            self.item_sizer.Add(item_label_sizer)
             new_canvas.draw()
 
             def _on_click(event, index=len(self.history_widgets)):
@@ -180,24 +189,26 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.effect_settings_container = wx.Notebook(self.main_window, wx.ID_ANY)
             for effect_name, effect_settings in sorted(effect_settings_info.items(), key=lambda x: x[0]):
                 new_page = wx.NotebookPage(self.effect_settings_container, wx.ID_ANY)
-                new_page_sizer = wx.GridSizer(2, wx.Size(5, 5))
+                new_page_sizer = wx.BoxSizer(orient=wx.VERTICAL)
+                new_page_form_sizer = wx.GridSizer(2, wx.Size(5, 5))
 
                 self.effect_setting_controls[effect_name] = dict()
                 for setting_key, setting in sorted(effect_settings.items(), key=lambda x: x[1].setting_name):
-                    new_page_sizer.Add(wx.StaticText(new_page, wx.ID_ANY, setting.setting_name))
+                    new_page_form_sizer.Add(wx.StaticText(new_page, wx.ID_ANY, setting.setting_name))
                     if setting.data_type == int:
                         text_input = wx.SpinCtrl(new_page, wx.ID_ANY, initial=initial_setting_values[effect_name][setting_key], min=(1 - 2 ** 31 if setting.range_min is None else setting.range_min),
                                                  max=(2 ** 31 if setting.range_max is None else setting.range_max))
                     elif setting.data_type == float:
                         text_input = wx.SpinCtrlDouble(new_page, wx.ID_ANY, initial=initial_setting_values[effect_name][setting_key], min=(1 - 2 ** 31 if setting.range_min is None else setting.range_min),
-                                                       max=(2 ** 31 if setting.range_max is None else setting.range_max))
+                                                       max=(2 ** 31 if setting.range_max is None else setting.range_max), inc=0.01)
                     else:
                         text_input = wx.TextCtrl(new_page, wx.ID_ANY, initial_setting_values[effect_name][setting_key])
 
                     text_input.Bind(wx.EVT_TEXT, lambda event, input_ctl=text_input, effect_name=effect_name, setting_key=setting_key: self._on_effect_setting_changed(input_ctl, effect_name, setting_key))
-                    new_page_sizer.Add(text_input)
+                    new_page_form_sizer.Add(text_input)
                     self.effect_setting_controls[effect_name][setting_key] = text_input
 
+                new_page_sizer.Add(new_page_form_sizer, wx.SizerFlags().Border(wx.ALL, 5))
                 new_page.SetSizerAndFit(new_page_sizer)
                 self.effect_settings_container.AddPage(new_page, effect_name)
 
@@ -296,13 +307,13 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 self.existing_x_bounds = new_x_bounds
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_EDIT_WINDOW, self.existing_x_bounds))
 
-        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool):
+        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str):
             self._plot_sample(new_sample, num_wavelengths)
 
             if is_checkpoint:
                 self.sample_snapshots.append((new_sample, num_wavelengths))
                 self.active_snapshot_index = len(self.sample_snapshots) - 1
-                self.history_view.add_entry(new_sample)
+                self.history_view.add_entry(new_sample, checkpoint_desc)
                 self.history_view.set_active(self.active_snapshot_index)
 
         def _on_effect_setting_changed(self, input_ctl: wx.TextCtrl, effect_name: str, setting_key: str):
@@ -404,7 +415,7 @@ class SampleEditorNativeUI:
         self.ui_process_recv_queue.put_nowait((IncomingMessageType.LOAD_PROJECT_DATA, project_samples, project_setting_values))
 
     def update_current_sample(self, sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str):
-        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, is_checkpoint))
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, is_checkpoint, checkpoint_desc))
 
     def get_events(self):
         try:
