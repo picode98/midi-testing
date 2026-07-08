@@ -1,6 +1,7 @@
 import multiprocessing
 import threading
 import queue
+import pathlib
 
 import numpy as np
 from enum import StrEnum
@@ -13,6 +14,7 @@ from typing import List, Tuple, Dict, Optional
 class IncomingMessageType(StrEnum):
     SET_SAMPLE = 'set_sample'
     LOAD_PROJECT_DATA = 'load_project_data'
+    UPDATE_RECORDING_STATE = 'update_recording_state'
 
 class OutgoingMessageType(StrEnum):
     SET_PROJECT_FOLDER = 'set_project_folder'
@@ -20,6 +22,10 @@ class OutgoingMessageType(StrEnum):
     SET_ACTIVE_SNAPSHOT = 'set_active_snapshot'
     SET_EFFECT_SETTING_VALUE = 'set_effect_setting_value'
     SET_SAMPLE_SIZE = 'set_sample_size'
+    RECORD_START = 'record_start'
+    RECORD_PAUSE = 'record_pause'
+    RECORD_CONTINUE = 'record_continue'
+    RECORD_STOP = 'record_stop'
     APPLICATION_EXIT = 'application_exit'
 
 class WavelengthAddMode(StrEnum):
@@ -29,6 +35,7 @@ class WavelengthAddMode(StrEnum):
 
 def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_process_recv_queue: multiprocessing.Queue, effect_settings_info: Dict[str, Dict[str, EffectSettings]], initial_setting_values: Dict[str, Dict[str, int | float | str]]):
     import wx
+    import wx.svg
     import wx.lib.newevent
     import wx.lib.scrolledpanel
 
@@ -38,10 +45,32 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
     # Implement the default Matplotlib key bindings.
     from matplotlib.backend_bases import key_press_handler
     from matplotlib.backends.backend_wxagg import (FigureCanvasWxAgg, NavigationToolbar2WxAgg)
-    
-    import pathlib
 
     ActiveItemChangedEvent, EVT_ACTIVE_ITEM_CHANGED = wx.lib.newevent.NewEvent()
+
+    class SVGButton(wx.Button):
+        def __init__(self, parent: wx.Window, id: int, label: str, svg_filepath: pathlib.Path) -> None:
+            super().__init__(parent, id, label)
+
+            self.set_image(svg_filepath)
+            # self.Bind(wx.EVT_SIZE, lambda event: self.render_image())
+
+        def set_image(self, svg_filepath: pathlib.Path):
+            # dc = wx.PaintDC(self)
+            # dc.SetBackground(wx.Brush(wx.Colour('white')))
+            # dc.Clear()
+
+            self.img: wx.svg.SVGimage = wx.svg.SVGimage.CreateFromFile(str(svg_filepath))
+            self.render_image()
+
+        def render_image(self):
+            img_size = self.GetSize()
+            img_size.IncBy(-10, -10)
+            rendered_bitmap = self.img.ConvertToScaledBitmap(img_size)
+            self.SetBitmap(wx.BitmapBundle(rendered_bitmap))
+
+            # ctx = wx.GraphicsContext.Create(dc)
+            # self.img.RenderToGC(ctx, scale)
 
     class SnapshotHistoryWidget(wx.lib.scrolledpanel.ScrolledPanel):
         def __init__(self, parent, height: int):
@@ -52,7 +81,6 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.item_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
             self.SetSizer(self.item_sizer)
 
-            # self.SetMinSize(wx.Size(0, height))
             self.SetupScrolling(scroll_x=True, scroll_y=False)
 
             self.active_index = None
@@ -77,9 +105,10 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             item_label_sizer.Add(desc_text, wx.SizerFlags().Align(wx.CENTER))
 
             new_canvas = FigureCanvasWxAgg(self, wx.ID_ANY, figure=new_figure)
+            new_canvas.draw()
+
             item_label_sizer.Add(new_canvas)
             self.item_sizer.Add(item_label_sizer)
-            new_canvas.draw()
 
             def _on_click(event, index=len(self.history_widgets)):
                 print('Setting ' + str(index) + ' to active.')
@@ -87,6 +116,8 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 wx.PostEvent(self.GetEventHandler(), ActiveItemChangedEvent(index=index))
 
             new_canvas.mpl_connect('button_release_event', _on_click)
+
+            wx.CallLater(1000, lambda: new_canvas._on_size(None))
 
             self.history_widgets.append((new_figure, new_canvas))
 
@@ -187,7 +218,8 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
 
             self.effect_setting_controls: Dict[str, Dict[str, wx.TextCtrl | wx.SpinCtrl | wx.SpinCtrlDouble]] = dict()
             self.effect_settings_container = wx.Notebook(self.main_window, wx.ID_ANY)
-            for effect_name, effect_settings in sorted(effect_settings_info.items(), key=lambda x: x[0]):
+            self.effect_page_indices: Dict[str, int] = dict()
+            for idx, (effect_name, effect_settings) in enumerate(sorted(effect_settings_info.items(), key=lambda x: x[0])):
                 new_page = wx.NotebookPage(self.effect_settings_container, wx.ID_ANY)
                 new_page_sizer = wx.BoxSizer(orient=wx.VERTICAL)
                 new_page_form_sizer = wx.GridSizer(2, wx.Size(5, 5))
@@ -211,14 +243,43 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 new_page_sizer.Add(new_page_form_sizer, wx.SizerFlags().Border(wx.ALL, 5))
                 new_page.SetSizerAndFit(new_page_sizer)
                 self.effect_settings_container.AddPage(new_page, effect_name)
+                self.effect_page_indices[effect_name] = idx
+
+            self.record_button = SVGButton(self.main_window, wx.ID_ANY, 'Record', pathlib.Path('./record_button.svg'))
+            self.record_button.Bind(wx.EVT_BUTTON, self._on_record_button_click)
+            self.pause_button = SVGButton(self.main_window, wx.ID_ANY, 'Record', pathlib.Path('./record_button.svg'))
+            self.pause_button.Bind(wx.EVT_BUTTON, self._on_pause_button_click)
+            self.pause_button.Show(False)
+            self.restart_button = SVGButton(self.main_window, wx.ID_ANY, 'Restart', pathlib.Path('./restart_button.svg'))
+            self.restart_button.Bind(wx.EVT_BUTTON, self._on_restart_button_click)
+            self.restart_button.Show(False)
+            self.elapsed_time_text = wx.StaticText(self.main_window, wx.ID_ANY, '')
+            self.elapsed_time_text.Show(False)
+
+            self.main_controls_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
+            self.main_controls_sizer.Add(self.record_button)
+            self.main_controls_sizer.AddSpacer(5)
+            self.main_controls_sizer.Add(self.pause_button)
+            self.main_controls_sizer.AddSpacer(5)
+            self.main_controls_sizer.Add(self.restart_button)
+            self.main_controls_sizer.AddSpacer(5)
+            self.main_controls_sizer.Add(self.elapsed_time_text)
+
+            self.right_panel_sizer = wx.BoxSizer(orient=wx.VERTICAL)
+            self.right_panel_sizer.Add(self.main_controls_sizer, wx.SizerFlags(proportion=0).Expand())
+            self.right_panel_sizer.Add(self.effect_settings_container, wx.SizerFlags(proportion=1).Expand())
 
             self.main_window_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
             self.main_window_sizer.Add(self.sample_view_sizer, wx.SizerFlags(proportion=1).Expand())
-            self.main_window_sizer.Add(self.effect_settings_container, wx.SizerFlags(proportion=1).Expand())
+            self.main_window_sizer.Add(self.right_panel_sizer, wx.SizerFlags(proportion=1).Expand())
             self.main_window.SetSizerAndFit(self.main_window_sizer)
 
-            self.sample_snapshots: List[Tuple[np.ndarray, int]] = []
+            self.sample_snapshots: List[Tuple[np.ndarray, int, str]] = []
             self.active_snapshot_index: Optional[int] = None
+            self.project_path: Optional[pathlib.Path] = None
+            self.recording_active: bool = False
+            self.recording_paused: bool = False
+            self.recording_path: Optional[str] = None
 
             self.wave_axes = None
             self.wave_artist = None
@@ -226,7 +287,7 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             
             self.application_exiting = False
 
-            self.synth_handlers = {IncomingMessageType.LOAD_PROJECT_DATA: self._on_project_load, IncomingMessageType.SET_SAMPLE: self._on_sample_set}
+            self.synth_handlers = {IncomingMessageType.LOAD_PROJECT_DATA: self._on_project_load, IncomingMessageType.SET_SAMPLE: self._on_sample_set, IncomingMessageType.UPDATE_RECORDING_STATE: self._on_recording_state_update}
             self.queue_pump_thread = threading.Thread(target=self._invoke_synth_handlers, name='Queue Pump Thread')
             self.queue_pump_thread.start()
 
@@ -271,14 +332,15 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
 
             self.active_wave_num_wavelengths_text.SetLabelText(str(num_wavelengths) + (' wavelengths' if num_wavelengths != 1 else ' wavelength'))
 
-        def _on_project_load(self, project_samples: List[Tuple[np.ndarray, int]], project_effect_settings: Dict[str, Dict[str, int | float | str]]):
+        def _on_project_load(self, project_path: pathlib.Path, project_samples: List[Tuple[np.ndarray, int, str]], project_effect_settings: Dict[str, Dict[str, int | float | str]]):
+            self.project_path = project_path
             self.sample_snapshots = project_samples
             self.active_snapshot_index = len(project_samples) - 1
             self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
 
             self.history_view.clear_entries()
-            for sample, _ in self.sample_snapshots:
-                self.history_view.add_entry(sample)
+            for sample, _, desc in self.sample_snapshots:
+                self.history_view.add_entry(sample, desc)
 
             self.history_view.set_active(self.active_snapshot_index)
 
@@ -294,6 +356,25 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             if dialog.result_wavelengths is not None:
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_SAMPLE_SIZE, dialog.result_wavelengths, dialog.result_add_mode))
 
+        def _on_record_button_click(self, event):
+            if self.recording_active:
+                ui_process_send_queue.put_nowait((OutgoingMessageType.RECORD_STOP,))
+            else:
+                file_path = wx.SaveFileSelector(parent=self.main_window, what='Recording destination file', extension='wav')
+                if len(file_path) > 0:
+                    self.recording_path = file_path
+                    ui_process_send_queue.put_nowait((OutgoingMessageType.RECORD_START, file_path))
+
+        def _on_pause_button_click(self, event):
+            if self.recording_paused:
+                ui_process_send_queue.put_nowait((OutgoingMessageType.RECORD_CONTINUE,))
+            else:
+                ui_process_send_queue.put_nowait((OutgoingMessageType.RECORD_PAUSE,))
+
+        def _on_restart_button_click(self, event):
+            assert self.recording_path is not None
+            ui_process_send_queue.put_nowait((OutgoingMessageType.RECORD_START, self.recording_path))
+
         def _on_sample_history_selection(self, event):
             self.active_snapshot_index = self.history_view.active_index
             assert self.active_snapshot_index is not None
@@ -307,14 +388,50 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 self.existing_x_bounds = new_x_bounds
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_EDIT_WINDOW, self.existing_x_bounds))
 
-        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str):
+        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str, last_effect_name: str):
             self._plot_sample(new_sample, num_wavelengths)
 
             if is_checkpoint:
-                self.sample_snapshots.append((new_sample, num_wavelengths))
+                self.sample_snapshots.append((new_sample, num_wavelengths, checkpoint_desc))
                 self.active_snapshot_index = len(self.sample_snapshots) - 1
                 self.history_view.add_entry(new_sample, checkpoint_desc)
                 self.history_view.set_active(self.active_snapshot_index)
+
+            if len(last_effect_name) > 0:
+                self.effect_settings_container.SetSelection(self.effect_page_indices[last_effect_name])
+
+        def _on_recording_state_update(self, recording_active: bool, recording_paused: bool, elapsed_time: Optional[float]):
+            if recording_active:
+                assert elapsed_time is not None
+                self.elapsed_time_text.SetLabelText(f'{int(elapsed_time) // 3600}:{(int(elapsed_time) // 60) % 60:02d}:{int(elapsed_time) % 60:02d}')
+
+            if self.recording_active != recording_active or self.recording_paused != recording_paused:
+                if recording_active:
+                    self.record_button.set_image(pathlib.Path('./stop_button.svg'))
+                    self.record_button.SetLabel('Stop')
+                    self.restart_button.Show(True)
+
+                    self.pause_button.Show(True)
+                    if recording_paused:
+                        self.pause_button.set_image(pathlib.Path('./play_button.svg'))
+                        self.pause_button.SetLabel('Play')
+                    else:
+                        self.pause_button.set_image(pathlib.Path('./pause_button.svg'))
+                        self.pause_button.SetLabel('Pause')
+
+                    self.elapsed_time_text.Show(True)
+                else:
+                    self.recording_path = None
+                    self.record_button.set_image(pathlib.Path('./record_button.svg'))
+                    self.record_button.SetLabel('Record')
+                    self.restart_button.Show(False)
+                    self.pause_button.Show(False)
+                    self.elapsed_time_text.Show(False)
+
+                self.main_controls_sizer.RepositionChildren(wx.Size(0, 0))
+            
+            self.recording_active = recording_active
+            self.recording_paused = recording_paused
 
         def _on_effect_setting_changed(self, input_ctl: wx.TextCtrl, effect_name: str, setting_key: str):
             text_value = input_ctl.GetTextValue()
@@ -411,11 +528,14 @@ class SampleEditorNativeUI:
         self.vis_process = multiprocessing.Process(target=_visualization_worker, args=(self.ui_process_send_queue, self.ui_process_recv_queue, effect_settings_info, initial_setting_values))
         self.vis_process.start()
 
-    def load_project_data(self, project_samples: List[Tuple[np.ndarray, int]], project_setting_values: Dict[str, Dict[str, int | float | str]]):
-        self.ui_process_recv_queue.put_nowait((IncomingMessageType.LOAD_PROJECT_DATA, project_samples, project_setting_values))
+    def load_project_data(self, project_path: pathlib.Path, project_samples: List[Tuple[np.ndarray, int, str]], project_setting_values: Dict[str, Dict[str, int | float | str]]):
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.LOAD_PROJECT_DATA, project_path, project_samples, project_setting_values))
 
-    def update_current_sample(self, sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str):
-        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, is_checkpoint, checkpoint_desc))
+    def update_current_sample(self, sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str, last_effect_name: str):
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, is_checkpoint, checkpoint_desc, last_effect_name))
+
+    def update_recording_status(self, recording_active: bool, recording_paused: bool, elapsed_time: Optional[float]):
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.UPDATE_RECORDING_STATE, recording_active, recording_paused, elapsed_time))
 
     def get_events(self):
         try:

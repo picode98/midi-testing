@@ -72,6 +72,27 @@ def read_wav_file(file_name: str):
     return (float_array, wave_obj.getframerate())
 
 
+class WavNPWriter:
+    def __init__(self, file_name: str, sample_width: int = 2, sample_rate: int = 44100):
+        self.wave_obj: wave.Wave_write = wave.open(file_name, 'wb')
+        self.wave_obj.setsampwidth(sample_width)
+        self.wave_obj.setframerate(sample_rate)
+
+        self.sample_width = sample_width
+        self.arr_dtype: np.dtype = {1: np.int8, 2: np.int16, 4: np.int32, 8: np.int64}[self.sample_width]
+        self.sample_max = 2 ** (8 * self.sample_width - 1) - 1
+
+    def write(self, frames: np.ndarray):
+        if self.wave_obj.getnframes() == 0:
+            self.wave_obj.setnchannels(frames.shape[1] if len(frames.shape) >= 2 else 1)
+
+        scaled_samples = (frames * self.sample_max).clip(min=-self.sample_max, max=self.sample_max).astype(self.arr_dtype)
+        byte_array = scaled_samples.tobytes('C')
+        self.wave_obj.writeframes(byte_array)
+
+    def close(self):
+        self.wave_obj.close()
+
 def write_wav_file(file_name: str, frames: np.ndarray, sample_width: int = 2, sample_rate: int = 44100):
     wave_obj: wave.Wave_write = wave.open(file_name, 'wb')
     wave_obj.setnframes(frames.shape[0])
@@ -92,10 +113,10 @@ class CustomOsc(ABC):
     def __init__(self, sample_rate=44100):
         self.sample_rate = sample_rate
 
-    def play_frames(self, num_frames: int):
+    def play_frames(self, num_frames: int) -> np.ndarray:
         return NotImplemented
 
-    def play(self, length):
+    def play(self, length) -> np.ndarray:
         total_frames = int(length * self.sample_rate)
         return self.play_frames(total_frames)
 

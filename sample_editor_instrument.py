@@ -73,6 +73,19 @@ class TremoloEffect(SampleEffect):
 
     def get_settings(self):
         return {**super().get_settings(), 'wavelength': EffectSettings('Wavelength', float, 0.0, None)}
+    
+class VibratoEffect(SampleEffect):
+    def __init__(self, wavelength: float):
+        super().__init__()
+        self.wavelength = wavelength
+
+    def apply_step(self, sample_slice: np.ndarray, slice_offset: int, resolution: int, magnitude: float):
+        base_indices = np.arange(len(sample_slice))
+        sampling_indices = base_indices + (magnitude / 10.0) * np.sin(2.0 * np.pi * base_indices / (self.wavelength * resolution))
+        sample_slice[:] = np.interp(sampling_indices, base_indices, sample_slice)
+
+    def get_settings(self):
+        return {**super().get_settings(), 'wavelength': EffectSettings('Wavelength', float, 0.0, None)}
 
 class PowerFadeEffect(SampleEffect):
     def apply_step(self, sample_slice: np.ndarray, slice_offset: int, resolution: int, magnitude: float):
@@ -257,7 +270,7 @@ class SampleEditorSynth(CustomSynth):
         self.effect_map = effect_map
         self.applying_effects = False
         self.current_effects: OrderedDict[int, Tuple[SampleEffect, float]] = OrderedDict()
-        self.effects_since_last_checkpoint: Dict[str, SampleEffect] = dict()
+        self.effects_since_last_checkpoint: List[SampleEffect] = []
         self.edit_min_sample: int = 0
         self.edit_max_sample: int = len(self.master_sample)
         self.bank_switch_key = bank_switch_key
@@ -272,7 +285,7 @@ class SampleEditorSynth(CustomSynth):
         elif event.key_num in self.effect_map[self.current_bank_index]:
             new_effect = self.effect_map[self.current_bank_index][event.key_num]
             self.current_effects[event.key_num] = (new_effect, event.velocity / 10.0)
-            self.effects_since_last_checkpoint[type(new_effect).__name__] = new_effect
+            self.effects_since_last_checkpoint.append(new_effect)
         else:
             note_frequency = get_piano_key_frequency(event.key_num)
             oscs += [SampleRepeatingOsc(self.master_sample, self.master_sample_wavelengths, note_frequency, event.velocity / 10.0)]
@@ -308,12 +321,12 @@ class SampleEditorSynth(CustomSynth):
         self.applying_effects = len(self.current_effects) > 0
 
         if is_checkpoint:
-            effect_dict = self.effects_since_last_checkpoint
-            self.effects_since_last_checkpoint = dict()
+            effect_list = self.effects_since_last_checkpoint
+            self.effects_since_last_checkpoint = []
         else:
-            effect_dict = None
+            effect_list = None
 
-        return is_checkpoint, effect_dict
+        return is_checkpoint, effect_list
 
     def set_edit_params(self, min_sample: int, max_sample: int):
         self.edit_min_sample, self.edit_max_sample = max(min(min_sample, len(self.master_sample)), 0), max(min(max_sample, len(self.master_sample)), 0)
@@ -390,7 +403,8 @@ if __name__ == '__main__':
                                            81 + 20: MixWithSawtoothWaveEffect(),
                                            82 + 20: MixWithSineWaveEffect(),
                                            83 + 20: MixWithSquareWaveEffect()},
-                                          {81 + 20: TremoloEffect(50.0),
+                                          {80 + 20: TremoloEffect(50.0),
+                                           81 + 20: VibratoEffect(20.0),
                                            82 + 20: FractionalWavelengthEffect(2),
                                            83 + 20: NoiseEffect(), 84 + 20: QuantizeEffect(20.0),
                                            85 + 20: PowerFadeEffect(),
@@ -408,7 +422,7 @@ if __name__ == '__main__':
     proj_manager.settings.effect_setting_values = initial_setting_values
 
     editor_ui = sample_editor_native_ui.SampleEditorNativeUI(all_settings_info, initial_setting_values)
-    editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, True, 'Default sine-wave sample')
+    editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, True, 'Default sine-wave sample', '')
     # vis_process = mp.Process(target=visualization_worker, args=(wave_queue, edit_params_queue))
     # vis_process.start()
     i = 0
@@ -427,7 +441,7 @@ if __name__ == '__main__':
                     for setting_key, setting_value in effect_settings.items():
                         setattr(effects_by_type[effect_name], setting_key, setting_value)
 
-                editor_ui.load_project_data([(sample_data, metadata.num_wavelengths) for (file_path, sample_data), metadata in zip(proj_manager.snapshot_data, proj_manager.settings.snapshots)], proj_manager.settings.effect_setting_values)
+                editor_ui.load_project_data(new_folder, [(sample_data, metadata.num_wavelengths, metadata.description) for (file_path, sample_data), metadata in zip(proj_manager.snapshot_data, proj_manager.settings.snapshots)], proj_manager.settings.effect_setting_values)
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_EDIT_WINDOW:
                 _, (new_lbound, new_hbound) = event
                 print(event)
@@ -444,21 +458,37 @@ if __name__ == '__main__':
                 sample_desc = f'Resized sample from {synth.master_sample_wavelengths} to {new_wavelengths} wavelengths with mode {add_mode}.'
                 synth.resize_sample(new_wavelengths, add_mode)
                 is_checkpoint = True
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.RECORD_START:
+                _, record_path = event
+                synth.start_record(record_path, 2)
+                editor_ui.update_recording_status(True, False, 0.0)
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.RECORD_PAUSE:
+                synth.pause_record()
+                editor_ui.update_recording_status(True, True, synth.samples_recorded / synth.output_stream.samplerate)
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.RECORD_CONTINUE:
+                synth.resume_record()
+                editor_ui.update_recording_status(True, False, synth.samples_recorded / synth.output_stream.samplerate)
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.RECORD_STOP:
+                synth.stop_record()
+                editor_ui.update_recording_status(False, False, None)
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.APPLICATION_EXIT:
                 exit(0)
 
 
         if is_checkpoint:
             if effects_since_last_checkpoint is not None:
-                sample_desc = 'Applied ' + sentence_from_list(list(effects_since_last_checkpoint.keys()))
+                sample_desc = 'Applied ' + sentence_from_list([type(effect).__name__ for effect in effects_since_last_checkpoint])
 
             proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths, sample_desc)
             if proj_manager.project_folder is not None:
                 proj_manager.write_project()
 
-            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, True, sample_desc)
+            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, True, sample_desc, (type(effects_since_last_checkpoint[-1]).__name__ if effects_since_last_checkpoint else ''))
         elif i % 10000 == 0:
-            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, False, '')
+            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, False, '', '')
+
+        if i % 1000 == 0 and synth.record_stream is not None:
+            editor_ui.update_recording_status(True, synth.record_paused, synth.samples_recorded / synth.output_stream.samplerate)
             # wave_queue.put(synth.master_sample)
 
             # new_edit_params = None
