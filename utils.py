@@ -133,8 +133,8 @@ def Fadeable(cls):
 
         def play_frames(self, num_frames: int):
             new_fade_coeff = self.fade_coeff - num_frames * self.fade_rate / self.sample_rate
-            fade_mul_array = np.linspace(self.fade_coeff, new_fade_coeff, num_frames)
             output = super().play_frames(num_frames)
+            fade_mul_array = np.linspace(self.fade_coeff, new_fade_coeff, output.shape[0])
 
             if new_fade_coeff < 0:
                 new_fade_coeff = 0

@@ -6,7 +6,7 @@ import numpy as np
 import sounddevice as sd
 from pygame import midi
 
-from utils import CustomOsc
+from utils import CustomOsc, WavNPWriter
 
 
 class MIDIMessage:
@@ -191,6 +191,9 @@ class CustomSynth(ABC):
 
         self.output_stream = output or sd.OutputStream(samplerate=sample_rate, latency=0.05)
         self.active_oscs: Dict[Tuple[int, int], List[CustomOsc]] = dict()
+        self.record_stream: Optional[WavNPWriter] = None
+        self.samples_recorded: Optional[int] = None
+        self.record_paused: bool = False
         self.recovering_stream = False
 
     def on_key_on(self, instrument: midi.Input, event: KeyOnMessage, oscs: List[CustomOsc]):
@@ -242,9 +245,11 @@ class CustomSynth(ABC):
             # print(accum_buf[:10])
                     
             # print('foo')
-                    
+            
+            accum_buf = accum_buf.clip(min=-1, max=1)
+
             try:
-                self.output_stream.write(accum_buf.clip(min=-1, max=1).astype(np.float32))
+                self.output_stream.write(accum_buf.astype(np.float32))
                 self.recovering_stream = False
             except sd.PortAudioError as ex:
                 if self.recovering_stream:
@@ -255,3 +260,25 @@ class CustomSynth(ABC):
                     self.output_stream.stop()
                     # self.output_stream = None
                     self.output_stream = sd.OutputStream(samplerate=self.output_stream.samplerate, latency=self.output_stream.latency)
+
+            if self.record_stream is not None and not self.record_paused:
+                self.record_stream.write(accum_buf)
+                self.samples_recorded += accum_buf.shape[0]
+
+    def start_record(self, file_path: str, sample_width: int):
+        self.record_stream = WavNPWriter(file_path, sample_width, self.output_stream.samplerate)
+        self.samples_recorded = 0
+
+    def pause_record(self):
+        self.record_paused = True
+
+    def resume_record(self):
+        self.record_paused = False
+
+    def stop_record(self):
+        if self.record_stream is not None:
+            self.record_stream.close()
+            self.record_stream = None
+            self.samples_recorded = None
+        
+        self.record_paused = False

@@ -6,7 +6,7 @@ import pathlib
 import numpy as np
 from enum import StrEnum
 
-from sample_editor_effect import EffectSettings, SampleEffect
+from sample_editor_effect import EffectSettings, SampleEffect, LoopedRegion
 
 from typing import List, Tuple, Dict, Optional
 
@@ -19,7 +19,9 @@ class IncomingMessageType(StrEnum):
 class OutgoingMessageType(StrEnum):
     SET_PROJECT_FOLDER = 'set_project_folder'
     SET_EDIT_WINDOW = 'set_edit_window'
+    SET_LOOP_REGIONS = 'set_loop_regions'
     SET_ACTIVE_SNAPSHOT = 'set_active_snapshot'
+    SET_PROJECT_SETTING_VALUE = 'set_project_setting_value'
     SET_EFFECT_SETTING_VALUE = 'set_effect_setting_value'
     SET_SAMPLE_SIZE = 'set_sample_size'
     RECORD_START = 'record_start'
@@ -35,6 +37,7 @@ class WavelengthAddMode(StrEnum):
 
 def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_process_recv_queue: multiprocessing.Queue, effect_settings_info: Dict[str, Dict[str, EffectSettings]], initial_setting_values: Dict[str, Dict[str, int | float | str]]):
     import wx
+    import wx.dataview
     import wx.svg
     import wx.lib.newevent
     import wx.lib.scrolledpanel
@@ -168,6 +171,19 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.result_add_mode = (WavelengthAddMode.ADD_SINE_WAVE if self.fill_option_sine_button.GetValue() else (WavelengthAddMode.ADD_SILENCE if self.fill_option_silence_button.GetValue() else WavelengthAddMode.ADD_LOOP))
             self.EndModal(wx.ID_OK)
 
+    class EditLoopRegionDialog(wx.Dialog):
+        def __init__(self, parent, current_wavelengths: int):
+            super().__init__(parent, wx.ID_ANY, title='Modify Wavelengths')
+
+            self.result_start: Optional[float] = None
+            self.result_end: Optional[float] = None
+            self.result_duration: Optional[float] = None
+
+            self.form_sizer = wx.GridSizer(cols=2, gap=wx.Size(5, 5))
+            self.form_sizer.Add(wx.StaticText(self, wx.ID_ANY, 'Loop start (relative to containing loop):'))
+            self.start_entry = wx.SpinCtrlDouble(self, wx.ID_ANY, initial=current_wavelengths, min=1, max=(2 ** 31 - 1))
+            self.form_sizer.Add(self.num_wavelengths_entry)
+
     class SampleEditorNativeUIApplication(wx.App):
         def OnInit(self):
             self.main_window = wx.Frame(None, wx.ID_ANY, title='Sample Editor')
@@ -206,6 +222,9 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.main_window.Bind(wx.EVT_MENU, lambda _: self._set_project_folder(), self.window_project_menu.Append(-1, item='Set Project Folder...'))
             self.window_menu.Append(self.window_project_menu, 'Project')
             self.window_edit_menu = wx.Menu()
+            self.auto_add_looped_region_item = self.window_edit_menu.AppendCheckItem(-1, item='Auto-Add Looped Regions\tCtrl+L')
+            self.main_window.Bind(wx.EVT_MENU, lambda _: self._auto_add_looped_region_toggled(), self.auto_add_looped_region_item)
+            self.window_edit_menu.AppendSeparator()
             self.main_window.Bind(wx.EVT_MENU, lambda _: self._undo_snapshot(), self.window_edit_menu.Append(-1, item='Undo (Use Previous Snapshot)\tCtrl+Z'))
             self.main_window.Bind(wx.EVT_MENU, lambda _: self._redo_snapshot(), self.window_edit_menu.Append(-1, item='Redo (Use Next Snapshot)\tCtrl+Y'))
             self.window_menu.Append(self.window_edit_menu, 'Edit')
@@ -256,6 +275,26 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.elapsed_time_text = wx.StaticText(self.main_window, wx.ID_ANY, '')
             self.elapsed_time_text.Show(False)
 
+            self.loop_view_sizer = wx.BoxSizer(orient=wx.VERTICAL)
+            self.loop_tree_view = wx.dataview.DataViewTreeCtrl(self.main_window, wx.ID_ANY)
+            self.loop_tree_view.Bind(wx.dataview.EVT_DATAVIEW_SELECTION_CHANGED, self._on_tree_view_loop_select)
+            self.loop_edit_form_sizer = wx.GridSizer(cols=2, gap=wx.Size(5, 5))
+            self.loop_edit_form_sizer.Add(wx.StaticText(self.main_window, wx.ID_ANY, 'Start (relative to containing loop):'))
+            self.loop_edit_start_entry = wx.SpinCtrlDouble(self.main_window, wx.ID_ANY, inc=0.01)
+            self.loop_edit_start_entry.Bind(wx.EVT_TEXT, self._on_loop_edit_start_input)
+            self.loop_edit_form_sizer.Add(self.loop_edit_start_entry)
+            self.loop_edit_form_sizer.Add(wx.StaticText(self.main_window, wx.ID_ANY, 'End (relative to containing loop):'))
+            self.loop_edit_end_entry = wx.SpinCtrlDouble(self.main_window, wx.ID_ANY, inc=0.01)
+            self.loop_edit_end_entry.Bind(wx.EVT_TEXT, self._on_loop_edit_end_input)
+            self.loop_edit_form_sizer.Add(self.loop_edit_end_entry)
+            self.loop_edit_form_sizer.Add(wx.StaticText(self.main_window, wx.ID_ANY, 'Duration (seconds):'))
+            self.loop_edit_duration_entry = wx.SpinCtrlDouble(self.main_window, wx.ID_ANY, inc=0.01)
+            self.loop_edit_duration_entry.Bind(wx.EVT_TEXT, self._on_loop_edit_duration_input)
+            self.loop_edit_form_sizer.Add(self.loop_edit_duration_entry)
+            self.loop_view_sizer.Add(self.loop_tree_view, wx.SizerFlags(proportion=2).Expand())
+            self.loop_view_sizer.Add(self.loop_edit_form_sizer, wx.SizerFlags(proportion=1).Expand())
+            self.loop_tree_view_selection: Optional[List[int]] = None
+
             self.main_controls_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
             self.main_controls_sizer.Add(self.record_button)
             self.main_controls_sizer.AddSpacer(5)
@@ -270,11 +309,12 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.right_panel_sizer.Add(self.effect_settings_container, wx.SizerFlags(proportion=1).Expand())
 
             self.main_window_sizer = wx.BoxSizer(orient=wx.HORIZONTAL)
-            self.main_window_sizer.Add(self.sample_view_sizer, wx.SizerFlags(proportion=1).Expand())
-            self.main_window_sizer.Add(self.right_panel_sizer, wx.SizerFlags(proportion=1).Expand())
+            self.main_window_sizer.Add(self.loop_view_sizer, wx.SizerFlags(proportion=1).Expand())
+            self.main_window_sizer.Add(self.sample_view_sizer, wx.SizerFlags(proportion=2).Expand())
+            self.main_window_sizer.Add(self.right_panel_sizer, wx.SizerFlags(proportion=2).Expand())
             self.main_window.SetSizerAndFit(self.main_window_sizer)
 
-            self.sample_snapshots: List[Tuple[np.ndarray, int, str]] = []
+            self.sample_snapshots: List[Tuple[np.ndarray, int, LoopedRegion, str]] = []
             self.active_snapshot_index: Optional[int] = None
             self.project_path: Optional[pathlib.Path] = None
             self.recording_active: bool = False
@@ -313,33 +353,88 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 
                 wx.CallAfter(self.synth_handlers[event_data[0]], *event_data[1:])
 
-        def _plot_sample(self, sample: np.ndarray, num_wavelengths: int):
-            if self.wave_axes is None or num_wavelengths != self.active_wave_last_drawn_num_wavelengths or len(sample) != self.active_wave_last_drawn_sample_length:
-                self.wave_axes = self.active_wave_graph.figure.gca()
-                self.wave_axes.clear()
-                self.wave_artist = self.wave_axes.plot(np.arange(sample.shape[0]), sample)[0]
-                self.wave_axes.set_xticks(np.linspace(0, len(sample), num_wavelengths + 1), [str(x) for x in range(num_wavelengths + 1)])
-                self.wave_axes.grid(visible=True, which='major', axis='x')
+        def _plot_sample(self, sample: np.ndarray, num_wavelengths: int, loop_region_tree: LoopedRegion):
+            if self.wave_axes is not None:
+                previous_x_min, previous_x_max = self.wave_axes.get_xbound()
+                previous_y_min, previous_y_max = self.wave_axes.get_ybound()
+            else:
+                previous_x_min, previous_x_max = 0.0, float(len(sample))
+                previous_y_min, previous_y_max = -1.0, 1.0
 
-                new_x_bound_min, new_x_bound_max = self.wave_axes.get_xbound()
-                self.existing_x_bounds = (int(round(new_x_bound_min)), int(round(new_x_bound_max)))
+            self.wave_axes = self.active_wave_graph.figure.gca()
 
-                self.active_wave_last_drawn_num_wavelengths = num_wavelengths
-                self.active_wave_last_drawn_sample_length = len(sample)
+            self.wave_axes.clear()
+            self.wave_axes.set_xticks(np.linspace(0, len(sample), num_wavelengths + 1), [str(x) for x in range(num_wavelengths + 1)])
+            self.wave_axes.grid(visible=True, which='major', axis='x')
 
-            self.wave_artist.set_ydata(sample)
+            selected_node = False
+            sample_resolution = len(sample) / num_wavelengths
+            def _plot_loop(loop: LoopedRegion, global_start: float, parent_length: float, tree_view_node: wx.dataview.DataViewItem, selection_path: List[int]):
+                nonlocal selected_node
+                prev_loop_end, prev_loop_end_sample = global_start, int(sample_resolution * global_start)
+                for i, sub_loop in enumerate(loop.sub_loops):
+                    sub_loop_start = global_start + (0.0 if sub_loop.start is None else sub_loop.start)
+                    sub_loop_end = global_start + (parent_length if sub_loop.end is None else sub_loop.end)
+                    sub_loop_start_sample = int(sample_resolution * sub_loop_start)
+                    sub_loop_end_sample = int(sample_resolution * sub_loop_end)
+                    if sub_loop_start > prev_loop_end:
+                        self.wave_axes.plot(np.arange(sub_loop_start_sample, sub_loop_end_sample), sample[sub_loop_start_sample:sub_loop_end_sample]) \
+                            [0].set_label(f'Loop from {sub_loop_start:.2f} to {sub_loop_end:.2f}' + ('' if sub_loop.loop_duration is None else f' ({sub_loop.loop_duration:.2f} s)'))
+                        
+                    sub_selection_path = selection_path + [i]
+                    tree_view_sub_node = self.loop_tree_view.AppendContainer(tree_view_node, f'Sub-loop ({sub_loop_start:.2f} to {sub_loop_end:.2f})', data=(selection_path + [i], sub_loop))
+                    if self.loop_tree_view_selection is not None and sub_selection_path == self.loop_tree_view_selection:
+                        self.loop_tree_view.Select(tree_view_sub_node)
+                        selected_node = True
+                    _plot_loop(sub_loop, sub_loop_start, sub_loop_end - sub_loop_start, tree_view_sub_node, selection_path + [i])
+                    prev_loop_end, prev_loop_end_sample = sub_loop_end, sub_loop_end_sample
+                    
+                if prev_loop_end < parent_length:
+                    self.wave_axes.plot(np.arange(prev_loop_end_sample, len(sample)), sample[prev_loop_end_sample:]) \
+                        [0].set_label(f'Loop from {prev_loop_end:.2f} to {parent_length:.2f}' + ('' if loop.loop_duration is None else f' ({loop.loop_duration:.2f} s)'))
+
+
+            self.loop_tree_view.DeleteAllItems()
+            root_tree_view_node = self.loop_tree_view.AppendContainer(wx.dataview.NullDataViewItem, f'Sample ({num_wavelengths} wavelengths)', data=([], loop_region_tree))
+
+            _plot_loop(loop_region_tree, 0.0, float(num_wavelengths), root_tree_view_node, [])
+            if not selected_node:
+                self.loop_tree_view_selection = None
+            
+            self.wave_axes.set_xbound(previous_x_min, previous_x_max)
+            self.wave_axes.set_ybound(previous_y_min, previous_y_max)
+
+            self.wave_axes.legend()
+
+
+
+
+            # if self.wave_axes is None or num_wavelengths != self.active_wave_last_drawn_num_wavelengths or len(sample) != self.active_wave_last_drawn_sample_length:
+            #     self.wave_axes = self.active_wave_graph.figure.gca()
+            #     self.wave_axes.clear()
+            #     self.wave_artist = self.wave_axes.plot(np.arange(sample.shape[0]), sample)[0]
+            #     self.wave_axes.set_xticks(np.linspace(0, len(sample), num_wavelengths + 1), [str(x) for x in range(num_wavelengths + 1)])
+            #     self.wave_axes.grid(visible=True, which='major', axis='x')
+
+            #     new_x_bound_min, new_x_bound_max = self.wave_axes.get_xbound()
+            #     self.existing_x_bounds = (int(round(new_x_bound_min)), int(round(new_x_bound_max)))
+
+            #     self.active_wave_last_drawn_num_wavelengths = num_wavelengths
+            #     self.active_wave_last_drawn_sample_length = len(sample)
+
+            # self.wave_artist.set_ydata(sample)
             self.active_wave_graph.draw()
 
             self.active_wave_num_wavelengths_text.SetLabelText(str(num_wavelengths) + (' wavelengths' if num_wavelengths != 1 else ' wavelength'))
 
-        def _on_project_load(self, project_path: pathlib.Path, project_samples: List[Tuple[np.ndarray, int, str]], project_effect_settings: Dict[str, Dict[str, int | float | str]]):
+        def _on_project_load(self, project_path: pathlib.Path, project_samples: List[Tuple[np.ndarray, int, LoopedRegion, str]], project_effect_settings: Dict[str, Dict[str, int | float | str]]):
             self.project_path = project_path
             self.sample_snapshots = project_samples
             self.active_snapshot_index = len(project_samples) - 1
-            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
 
             self.history_view.clear_entries()
-            for sample, _, desc in self.sample_snapshots:
+            for sample, _, _, desc in self.sample_snapshots:
                 self.history_view.add_entry(sample, desc)
 
             self.history_view.set_active(self.active_snapshot_index)
@@ -379,7 +474,7 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
             self.active_snapshot_index = self.history_view.active_index
             assert self.active_snapshot_index is not None
             ui_process_send_queue.put_nowait((OutgoingMessageType.SET_ACTIVE_SNAPSHOT, self.active_snapshot_index))
-            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
 
         def _on_active_plot_moved(self, event):
             new_x_bound_min, new_x_bound_max = self.wave_axes.get_xbound()
@@ -388,11 +483,47 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
                 self.existing_x_bounds = new_x_bounds
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_EDIT_WINDOW, self.existing_x_bounds))
 
-        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str, last_effect_name: str):
-            self._plot_sample(new_sample, num_wavelengths)
+        def _on_tree_view_loop_select(self, event):
+            if self.loop_tree_view.Selection != wx.dataview.NullDataViewItem:
+                selection_path: List[int]
+                loop_region: LoopedRegion
+                selection_path, loop_region = self.loop_tree_view.GetItemData(self.loop_tree_view.Selection)
+                self.loop_tree_view_selection = selection_path
+                self.loop_edit_start_entry.SetValue('' if loop_region.start is None else loop_region.start)
+                self.loop_edit_end_entry.SetValue('' if loop_region.end is None else loop_region.end)
+                self.loop_edit_duration_entry.SetValue('' if loop_region.loop_duration is None else loop_region.loop_duration)
+            else:
+                self.loop_tree_view_selection = None
+
+        def _on_loop_edit_start_input(self, event):
+            selection_path: List[int]
+            loop_region: LoopedRegion
+            selection_path, loop_region = self.loop_tree_view.GetItemData(self.loop_tree_view.Selection)
+            loop_region.start = None if len(self.loop_edit_start_entry.TextValue) == 0 else self.loop_edit_start_entry.Value
+            ui_process_send_queue.put_nowait((OutgoingMessageType.SET_LOOP_REGIONS, self.sample_snapshots[self.active_snapshot_index][2]))
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
+
+        def _on_loop_edit_end_input(self, event):
+            selection_path: List[int]
+            loop_region: LoopedRegion
+            selection_path, loop_region = self.loop_tree_view.GetItemData(self.loop_tree_view.Selection)
+            loop_region.end = None if len(self.loop_edit_end_entry.TextValue) == 0 else self.loop_edit_end_entry.Value
+            ui_process_send_queue.put_nowait((OutgoingMessageType.SET_LOOP_REGIONS, self.sample_snapshots[self.active_snapshot_index][2]))
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
+
+        def _on_loop_edit_duration_input(self, event):
+            selection_path: List[int]
+            loop_region: LoopedRegion
+            selection_path, loop_region = self.loop_tree_view.GetItemData(self.loop_tree_view.Selection)
+            loop_region.loop_duration = None if len(self.loop_edit_duration_entry.TextValue) == 0 else self.loop_edit_duration_entry.Value
+            ui_process_send_queue.put_nowait((OutgoingMessageType.SET_LOOP_REGIONS, self.sample_snapshots[self.active_snapshot_index][2]))
+            self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
+
+        def _on_sample_set(self, new_sample: np.ndarray, num_wavelengths: int, loop_region_tree: LoopedRegion, is_checkpoint: bool, checkpoint_desc: str, last_effect_name: str):
+            self._plot_sample(new_sample, num_wavelengths, loop_region_tree)
 
             if is_checkpoint:
-                self.sample_snapshots.append((new_sample, num_wavelengths, checkpoint_desc))
+                self.sample_snapshots.append((new_sample, num_wavelengths, loop_region_tree, checkpoint_desc))
                 self.active_snapshot_index = len(self.sample_snapshots) - 1
                 self.history_view.add_entry(new_sample, checkpoint_desc)
                 self.history_view.set_active(self.active_snapshot_index)
@@ -460,18 +591,21 @@ def _visualization_worker(ui_process_send_queue: multiprocessing.Queue, ui_proce
 
                 print('Current project folder set to ' + str(current_project_folder))
 
+        def _auto_add_looped_region_toggled(self):
+            ui_process_send_queue.put_nowait((OutgoingMessageType.SET_PROJECT_SETTING_VALUE, 'enable_auto_loop_regions', self.auto_add_looped_region_item.IsChecked()))
+
         def _undo_snapshot(self):
             if self.active_snapshot_index is not None and self.active_snapshot_index >= 1:
                 self.active_snapshot_index -= 1
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_ACTIVE_SNAPSHOT, self.active_snapshot_index))
-                self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
+                self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
                 self.history_view.set_active(self.active_snapshot_index)
 
         def _redo_snapshot(self):
             if self.active_snapshot_index is not None and self.active_snapshot_index < len(self.sample_snapshots) - 1:
                 self.active_snapshot_index += 1
                 ui_process_send_queue.put_nowait((OutgoingMessageType.SET_ACTIVE_SNAPSHOT, self.active_snapshot_index))
-                self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1])
+                self._plot_sample(self.sample_snapshots[self.active_snapshot_index][0], self.sample_snapshots[self.active_snapshot_index][1], self.sample_snapshots[self.active_snapshot_index][2])
                 self.history_view.set_active(self.active_snapshot_index)
 
     # root = tkinter.Tk()
@@ -528,11 +662,11 @@ class SampleEditorNativeUI:
         self.vis_process = multiprocessing.Process(target=_visualization_worker, args=(self.ui_process_send_queue, self.ui_process_recv_queue, effect_settings_info, initial_setting_values))
         self.vis_process.start()
 
-    def load_project_data(self, project_path: pathlib.Path, project_samples: List[Tuple[np.ndarray, int, str]], project_setting_values: Dict[str, Dict[str, int | float | str]]):
+    def load_project_data(self, project_path: pathlib.Path, project_samples: List[Tuple[np.ndarray, int, LoopedRegion, str]], project_setting_values: Dict[str, Dict[str, int | float | str]]):
         self.ui_process_recv_queue.put_nowait((IncomingMessageType.LOAD_PROJECT_DATA, project_path, project_samples, project_setting_values))
 
-    def update_current_sample(self, sample: np.ndarray, num_wavelengths: int, is_checkpoint: bool, checkpoint_desc: str, last_effect_name: str):
-        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, is_checkpoint, checkpoint_desc, last_effect_name))
+    def update_current_sample(self, sample: np.ndarray, num_wavelengths: int, loop_region_tree: LoopedRegion, is_checkpoint: bool, checkpoint_desc: str, last_effect_name: str):
+        self.ui_process_recv_queue.put_nowait((IncomingMessageType.SET_SAMPLE, sample, num_wavelengths, loop_region_tree, is_checkpoint, checkpoint_desc, last_effect_name))
 
     def update_recording_status(self, recording_active: bool, recording_paused: bool, elapsed_time: Optional[float]):
         self.ui_process_recv_queue.put_nowait((IncomingMessageType.UPDATE_RECORDING_STATE, recording_active, recording_paused, elapsed_time))
