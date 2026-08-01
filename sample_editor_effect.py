@@ -1,8 +1,9 @@
 import dataclasses
 from abc import ABC
-from typing import Type, Optional, Dict
+from typing import Type, Optional, Dict, List
 
 import numpy as np
+import dataclasses_json
 
 @dataclasses.dataclass
 class EffectSettings:
@@ -20,3 +21,13 @@ class SampleEffect(ABC):
 
     def get_settings(self) -> Dict[str, EffectSettings]:
         return {'sensitivity': EffectSettings('Sensitivity', float, 0.0, None)}
+    
+@dataclasses.dataclass
+class LoopedRegion(dataclasses_json.DataClassJsonMixin):
+    start: Optional[float]
+    end: Optional[float]
+    loop_duration: Optional[float]
+    sub_loops: List['LoopedRegion']
+
+    def deep_copy(self):
+        return dataclasses.replace(self, sub_loops=[loop.deep_copy() for loop in self.sub_loops])
