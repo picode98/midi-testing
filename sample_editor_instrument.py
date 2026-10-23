@@ -4,14 +4,14 @@ from abc import ABC
 from collections import OrderedDict
 import pathlib
 import json
-from typing import Type
+from typing import Any, Type
 
 import numpy as np
 from pygame import midi
 import dataclasses_json
 # import resampy
 
-from sample_editor_effect import EffectSettings, SampleEffect, LoopedRegion
+from sample_editor_effect import EffectSettings, SampleEffect, LoopedRegion, FrequencyDomainModifier, TimeDomainModifier, SampleEditorSnapshot, SnapshotExternalWAVFile
 from midi_utils import *
 from midi_utils import KeyOffMessage, KeyOnMessage, np
 from utils import CustomOsc, Fadeable, read_wav_file, write_wav_file, sentence_from_list
@@ -93,12 +93,14 @@ def square_waveform(num_wavelengths: float, num_samples: int, duty_cycle: float)
 
 @Fadeable
 class SampleRepeatingOsc(CustomOsc):
-    def __init__(self, sample_buf: np.ndarray, num_wavelengths: int, looped_region_tree: LoopedRegion, frequency: float, amplitude: float, sample_rate=44100):
+    def __init__(self, sample_buf: np.ndarray, num_wavelengths: int, looped_region_tree: LoopedRegion, fd_modifiers: List[FrequencyDomainModifier], td_modifiers: List[TimeDomainModifier], frequency: float, amplitude: float, sample_rate=44100):
         super().__init__(sample_rate)
         self.sample_buf = sample_buf
         self.sample_offset = 0.0
         self.total_frames_played = 0
         self.looped_region: LoopedRegion = looped_region_tree
+        self.fd_modifiers: List[FrequencyDomainModifier] = fd_modifiers
+        self.td_modifiers: List[TimeDomainModifier] = td_modifiers
         self.current_child_osc: Optional[SampleRepeatingOsc] = None
         # self.active_loop_counts = dict()
         # self.next_looped_region_idx = 0
@@ -116,28 +118,38 @@ class SampleRepeatingOsc(CustomOsc):
         resampled_buf = np.zeros((num_frames,), dtype=self.sample_buf.dtype)
         while result_frames < num_frames:
             if self.current_child_osc is None:
-                frames_to_generate = float(num_frames - result_frames)
+                frame_frequencies = np.full((num_frames - result_frames,), self.frequency, dtype=np.float64)
+                for modifier in self.fd_modifiers:
+                    frame_frequencies = modifier.apply(frame_frequencies, self.sample_rate)
+
+                wavelength_offsets = np.cumsum(frame_frequencies / self.sample_rate)
+                wavelengths_covered = wavelength_offsets[-1]
+
+                frames_to_generate = num_frames - result_frames
                 buf_max_index = self.sample_buf.shape[0] - 1
-                frames_covered = frames_to_generate * (self.frequency / self.sample_frequency)
+                # frames_covered = frames_to_generate * (self.frequency / self.sample_frequency)
                 if len(self.looped_region.sub_loops) > 0:
                     loop_range_frames = [(int((0.0 if loop.start is None else loop.start) * self.samples_per_wavelength),
                                           int((self.num_wavelengths if loop.end is None else loop.end) * self.samples_per_wavelength)) for loop in self.looped_region.sub_loops]
                     loop_idx, next_loop_start_dist = min(((i, start - self.sample_offset if start >= self.sample_offset else len(self.sample_buf) - (self.sample_offset - start)) for i, (start, end) in enumerate(loop_range_frames)), key=lambda x: x[1])
-                    if next_loop_start_dist <= frames_covered:
+                    if next_loop_start_dist <= wavelengths_covered:
                         print(f'Starting loop {loop_idx} after generating {next_loop_start_dist} frames, sample_offset = {self.sample_offset}')
-                        frames_covered = next_loop_start_dist
-                        frames_to_generate = frames_covered / (self.frequency / self.sample_frequency)
+                        wavelengths_covered = next_loop_start_dist
+                        frames_to_generate = np.searchsorted(wavelength_offsets, [wavelengths_covered], side='left')[0]
                         child_loop = self.looped_region.sub_loops[loop_idx]
                         self.current_child_osc = SampleRepeatingOsc(self.sample_buf[loop_range_frames[loop_idx][0]:loop_range_frames[loop_idx][1]],
                             (loop_range_frames[loop_idx][1] - loop_range_frames[loop_idx][0]) / self.samples_per_wavelength,
-                            child_loop, self.frequency, self.amplitude, self.sample_rate)
+                            child_loop, self.fd_modifiers, self.td_modifiers, self.frequency, self.amplitude, self.sample_rate)
 
-                frame_indices = (np.arange(frames_to_generate) * (self.frequency / self.sample_frequency) + self.sample_offset) % buf_max_index
+                frame_indices = ((wavelength_offsets[:frames_to_generate] + self.sample_offset) * self.samples_per_wavelength) % buf_max_index
                 # print(frame_indices)
                 # assert frame_indices.shape[0] == frames_to_generate
-                self.sample_offset = (self.sample_offset + frames_covered) % buf_max_index
+                self.sample_offset = (self.sample_offset + wavelengths_covered) % buf_max_index
                 resampled_buf[result_frames:result_frames + len(frame_indices)] = np.interp(frame_indices, np.arange(self.sample_buf.shape[0]), self.sample_buf)
                 result_frames += len(frame_indices)
+
+                for modifier in self.td_modifiers:
+                    resampled_buf = modifier.apply(resampled_buf, self.sample_rate)
             else:
                 child_frames = self.current_child_osc.play_frames(num_frames - result_frames)
                 resampled_buf[result_frames:result_frames + len(child_frames)] = child_frames
@@ -175,11 +187,31 @@ class SampleRepeatingOsc(CustomOsc):
             # self.sample_offset = next_sample_offset
 
         self.total_frames_played += num_frames
-        return resampled_buf # np.transpose(np.tile(self.amplitude * resampled_buf, (2, 1)))
+        return 0.2 * resampled_buf # np.transpose(np.tile(self.amplitude * resampled_buf, (2, 1)))
 
 # test_buf = np.sin(np.linspace(0.0, 80 * (2.0 * pi), 80 * 1000, endpoint=False))
 # test_osc = SampleRepeatingOsc(test_buf, 80, LoopedRegion(None, None, None, [LoopedRegion(10.0, 20.0, 10.0, [])]), 441.0, 1.0)
 # result = test_osc.play_frames(44100 * 10)
+
+@dataclasses.dataclass
+class FrequencyModulator(FrequencyDomainModifier):
+    value_buffer_offset: int = dataclasses.field(default=0, metadata=dataclasses_json.config(exclude=lambda _: True))
+
+    def apply(self, sample: np.ndarray, sample_rate: int):
+        assert self.value_buffer is not None and self.value_buffer.values is not None
+        offsets = (np.arange(sample.shape[0]) + self.value_buffer_offset) % self.value_buffer.values.shape[0]
+        self.value_buffer_offset = (offsets[-1] + 1) % self.value_buffer.values.shape[0]
+        return sample * (self.value_buffer.values[offsets] * 0.25 + 1.0)
+
+@dataclasses.dataclass
+class AmplitudeModulator(TimeDomainModifier):
+    value_buffer_offset: int = dataclasses.field(default=0, metadata=dataclasses_json.config(exclude=lambda _: True))
+
+    def apply(self, sample: np.ndarray, sample_rate: int):
+        assert self.value_buffer is not None and self.value_buffer.values is not None
+        offsets = (np.arange(sample.shape[0]) + self.value_buffer_offset) % self.value_buffer.values.shape[0]
+        self.value_buffer_offset = (offsets[-1] + 1) % self.value_buffer.values.shape[0]
+        return np.clip(sample * (self.value_buffer.values[offsets] + 1.0), -1.0, 1.0)
 
 class TremoloEffect(SampleEffect):
     def __init__(self, wavelength: float):
@@ -322,12 +354,12 @@ class MixWithSquareWaveEffect(MixWithStaticSampleEffect):
     def get_settings(self):
         return {**super().get_settings(), 'duty_cycle': EffectSettings('Duty cycle', float, 0.0, 1.0)}
 
-@dataclasses.dataclass
-class SampleEditorSnapshot(dataclasses_json.DataClassJsonMixin):
-    path: str
-    num_wavelengths: int
-    loop_tree: LoopedRegion
-    description: str
+# @dataclasses.dataclass
+# class SampleEditorSnapshot(dataclasses_json.DataClassJsonMixin):
+#     path: str
+#     num_wavelengths: int
+#     loop_tree: LoopedRegion
+#     description: str
 
 @dataclasses.dataclass
 class SampleEditorProjectSettings(dataclasses_json.DataClassJsonMixin):
@@ -335,31 +367,48 @@ class SampleEditorProjectSettings(dataclasses_json.DataClassJsonMixin):
     snapshots: List[SampleEditorSnapshot] = dataclasses.field(default_factory=lambda: [])
     effect_setting_values: Dict[str, Dict[str, int | float | str]] = dataclasses.field(default_factory=lambda: dict())
 
+    @classmethod
+    def from_dict_polymorphic(cls, values: Dict, fd_modifier_class_map: Dict[str, Type[FrequencyDomainModifier]], td_modifier_class_map: Dict[str, Type[TimeDomainModifier]]) -> 'SampleEditorProjectSettings':
+        result = cls.from_dict({**values, 'snapshots': []})
+        result.snapshots = [SampleEditorSnapshot.from_dict_polymorphic(snapshot_data, fd_modifier_class_map, td_modifier_class_map) for snapshot_data in values['snapshots']]
+
+        return result
+
+    def to_dict_polymorphic(self):
+        return {**self.to_dict(), 'snapshots': [snapshot.to_dict_polymorphic() for snapshot in self.snapshots]}
+
 class SampleEditorProjectManager:
     def __init__(self):
         self.project_folder: Optional[pathlib.Path] = None
         self.settings = SampleEditorProjectSettings()
-        self.snapshot_data = []
+        # self.snapshot_data = []
 
-    def append_snapshot(self, sample_data: np.ndarray, num_wavelengths: int, loop_tree: LoopedRegion, sample_desc: str):
-        new_snapshot_path = f'{len(self.snapshot_data) + 1:05d}.wav'
-        self.snapshot_data.append((new_snapshot_path, sample_data.copy()))
-        self.settings.snapshots.append(SampleEditorSnapshot(new_snapshot_path, num_wavelengths, loop_tree.deep_copy(), sample_desc))
+    def append_snapshot(self, sample_data: np.ndarray, num_wavelengths: int, loop_tree: LoopedRegion, sample_desc: str, fd_modifiers: List[FrequencyDomainModifier], td_modifiers: List[TimeDomainModifier]):
+        new_snapshot_path = f'{len(self.settings.snapshots) + 1:05d}.wav'
+        copied_fd_modifiers = [dataclasses.replace(modifier, value_buffer=SnapshotExternalWAVFile(f'{len(self.settings.snapshots) + 1:05d}_FD_{i:05d}.wav', modifier.value_buffer.values.copy())) for i, modifier in enumerate(fd_modifiers)]
+        copied_td_modifiers = [dataclasses.replace(modifier, value_buffer=SnapshotExternalWAVFile(f'{len(self.settings.snapshots) + 1:05d}_TD_{i:05d}.wav', modifier.value_buffer.values.copy())) for i, modifier in enumerate(td_modifiers)]
+        # self.snapshot_data.append((new_snapshot_path, sample_data.copy()))
+        new_snapshot = SampleEditorSnapshot(SnapshotExternalWAVFile(new_snapshot_path, sample_data.copy()), num_wavelengths, loop_tree.deep_copy(), sample_desc, copied_fd_modifiers, copied_td_modifiers)
+        self.settings.snapshots.append(new_snapshot)
+        return new_snapshot
 
     def write_project(self):
         assert self.project_folder is not None
         self.project_folder.mkdir(exist_ok=True)
 
-        proj_data_obj = self.settings.to_dict()
+        proj_data_obj = self.settings.to_dict_polymorphic()
         with (self.project_folder / 'project.json').open('w') as proj_file:
             json.dump(proj_data_obj, proj_file)
 
-        for rel_path, sample_data in self.snapshot_data:
-            try:
-                with (self.project_folder / rel_path).open('xb') as created_data_file:
-                    write_wav_file(created_data_file, sample_data)
-            except FileExistsError:
-                pass
+        for snapshot in self.settings.snapshots:
+            snapshot.save(self.project_folder)
+
+        # for rel_path, sample_data in self.snapshot_data:
+        #     try:
+        #         with (self.project_folder / rel_path).open('xb') as created_data_file:
+        #             write_wav_file(created_data_file, sample_data)
+        #     except FileExistsError:
+        #         pass
 
     def set_project_folder(self, new_path: pathlib.Path):
         self.project_folder = new_path
@@ -371,12 +420,14 @@ class SampleEditorProjectManager:
             self.write_project()
             return
         
-        self.settings = SampleEditorProjectSettings.from_dict(proj_data)
-        
-        self.snapshot_data: List[Tuple[str, np.ndarray]] = []
+        self.settings = SampleEditorProjectSettings.from_dict_polymorphic(proj_data, {'FrequencyModulator': FrequencyModulator}, {'AmplitudeModulator': AmplitudeModulator})
         for snapshot in self.settings.snapshots:
-            frames, sample_rate = read_wav_file(str(self.project_folder / snapshot.path))
-            self.snapshot_data.append((snapshot.path, frames))
+            snapshot.load(self.project_folder)
+        
+        # self.snapshot_data: List[Tuple[str, np.ndarray]] = []
+        # for snapshot in self.settings.snapshots:
+        #     frames, sample_rate = read_wav_file(str(self.project_folder / snapshot.path))
+        #     self.snapshot_data.append((snapshot.path, frames))
 
 
 
@@ -390,6 +441,9 @@ class SampleEditorSynth(CustomSynth):
         self.loop_region_tree = LoopedRegion(None, None, None, [])
         self.sample_resolution = sample_resolution
         self.effect_map = effect_map
+        self.fd_modifiers = [FrequencyModulator(SnapshotExternalWAVFile('', np.sin(np.linspace(0.0, 1.0 * (2.0 * pi), 22050, endpoint=False))))]
+        self.td_modifiers = [AmplitudeModulator(SnapshotExternalWAVFile('', np.full((22050,), 0.0, dtype=np.float64)))]
+        self.editing_modifier_index: Optional[int] = None
         self.applying_effects = False
         self.current_effects: OrderedDict[int, Tuple[SampleEffect, float]] = OrderedDict()
         self.effects_since_last_checkpoint: List[SampleEffect] = []
@@ -410,7 +464,8 @@ class SampleEditorSynth(CustomSynth):
             self.effects_since_last_checkpoint.append(new_effect)
         else:
             note_frequency = get_piano_key_frequency(event.key_num)
-            oscs += [SampleRepeatingOsc(self.master_sample, self.master_sample_wavelengths, self.loop_region_tree, note_frequency, event.velocity / 10.0)]
+            oscs += [SampleRepeatingOsc(self.master_sample, self.master_sample_wavelengths, self.loop_region_tree, [dataclasses.replace(modifier) for modifier in self.fd_modifiers],
+                                        [dataclasses.replace(modifier) for modifier in self.td_modifiers], note_frequency, event.velocity / 10.0)]
 
     def on_key_off(self, instrument: midi.Input, event: KeyOffMessage, oscs: List[CustomOsc]):
         if event.key_num in self.current_effects:
@@ -420,22 +475,24 @@ class SampleEditorSynth(CustomSynth):
                 osc.fade_rate = 5.0
 
     def update_output(self):
+        editing_sample = self.master_sample if self.editing_modifier_index is None else (self.fd_modifiers + self.td_modifiers)[self.editing_modifier_index].value_buffer.values
         for effect, magnitude in self.current_effects.values():
-            if self.effect_feather_size is not None and (self.edit_min_sample > 0 or self.edit_max_sample < len(self.master_sample)):
+            if self.effect_feather_size is not None and (self.edit_min_sample > 0 or self.edit_max_sample < len(editing_sample)):
                 begin_slice = slice(self.edit_min_sample, self.edit_min_sample + self.effect_feather_size)
                 end_slice = slice(self.edit_max_sample - self.effect_feather_size, self.edit_max_sample)
-                feather_start_region = self.master_sample[begin_slice].copy()
-                feather_stop_region =  self.master_sample[end_slice].copy()
+                feather_start_region = editing_sample[begin_slice].copy()
+                feather_stop_region =  editing_sample[end_slice].copy()
 
-            effect.apply_step(self.master_sample[self.edit_min_sample:self.edit_max_sample], self.edit_min_sample, self.sample_resolution, magnitude * effect.sensitivity)
+            effect.apply_step(editing_sample[self.edit_min_sample:self.edit_max_sample], self.edit_min_sample, self.sample_resolution, magnitude * effect.sensitivity)
 
-            if self.effect_feather_size is not None and (self.edit_min_sample > 0 or self.edit_max_sample < len(self.master_sample)):
-                self.master_sample[begin_slice] = self.master_sample[begin_slice] * self.effect_feather_ramp + (1.0 - self.effect_feather_ramp) * feather_start_region
-                self.master_sample[end_slice] = self.master_sample[end_slice] * self.effect_feather_ramp[::-1] + (1.0 - self.effect_feather_ramp[::-1]) * feather_stop_region
+            if self.effect_feather_size is not None and (self.edit_min_sample > 0 or self.edit_max_sample < len(editing_sample)):
+                editing_sample[begin_slice] = editing_sample[begin_slice] * self.effect_feather_ramp + (1.0 - self.effect_feather_ramp) * feather_start_region
+                editing_sample[end_slice] = editing_sample[end_slice] * self.effect_feather_ramp[::-1] + (1.0 - self.effect_feather_ramp[::-1]) * feather_stop_region
 
-        max_val = np.max(np.abs(self.master_sample))
-        if max_val > 1.0:
-            self.master_sample /= max_val
+        if self.editing_modifier_index is None:
+            max_val = np.max(np.abs(self.master_sample))
+            if max_val > 1.0:
+                self.master_sample /= max_val
 
         super().update_output()
 
@@ -451,7 +508,8 @@ class SampleEditorSynth(CustomSynth):
         return is_checkpoint, effect_list
 
     def set_edit_params(self, min_sample: int, max_sample: int):
-        self.edit_min_sample, self.edit_max_sample = max(min(min_sample, len(self.master_sample)), 0), max(min(max_sample, len(self.master_sample)), 0)
+        editing_sample = self.master_sample if self.editing_modifier_index is None else (self.fd_modifiers + self.td_modifiers)[self.editing_modifier_index].value_buffer.values
+        self.edit_min_sample, self.edit_max_sample = max(min(min_sample, len(editing_sample)), 0), max(min(max_sample, len(editing_sample)), 0)
     
     def set_master_sample(self, new_sample: np.ndarray, new_num_wavelengths: int):
         self.master_sample_wavelengths = new_num_wavelengths
@@ -462,6 +520,15 @@ class SampleEditorSynth(CustomSynth):
                 osc.sample_buf = self.master_sample
                 if osc.sample_offset >= len(self.master_sample):
                     osc.sample_offset = 0
+
+    def set_modifiers(self, fd_modifiers: List[FrequencyDomainModifier], td_modifiers: List[TimeDomainModifier]):
+        synth.fd_modifiers = [modifier.deep_copy() for modifier in fd_modifiers]
+        synth.td_modifiers = [modifier.deep_copy() for modifier in td_modifiers]
+
+        for osc_list in self.active_oscs.values():
+            for osc in osc_list:
+                osc.fd_modifiers = [dataclasses.replace(modifier) for modifier in self.fd_modifiers]
+                osc.td_modifiers = [dataclasses.replace(modifier) for modifier in self.td_modifiers]
 
     def resize_sample(self, new_num_wavelengths: int, add_mode: sample_editor_native_ui.WavelengthAddMode):
         new_sample = np.resize(self.master_sample, (new_num_wavelengths * self.sample_resolution,))
@@ -559,7 +626,7 @@ if __name__ == '__main__':
                                            88 + 20: SmoothingEffect(5)}], sample_resolution=1000)
 
     proj_manager = SampleEditorProjectManager()
-    proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, 'Default sine-wave sample')
+    proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, 'Default sine-wave sample', synth.fd_modifiers, synth.td_modifiers)
     # wave_queue = mp.Queue()
     # edit_params_queue = mp.Queue()
     effects_by_type = {type(effect).__name__: effect for bank_map in synth.effect_map for effect in bank_map.values()}
@@ -567,8 +634,9 @@ if __name__ == '__main__':
     initial_setting_values = {effect_type: {setting_key: getattr(effects_by_type[effect_type], setting_key) for setting_key in effect_settings.keys()} for effect_type, effect_settings in all_settings_info.items()}
     proj_manager.settings.effect_setting_values = initial_setting_values
 
-    editor_ui = sample_editor_native_ui.SampleEditorNativeUI(all_settings_info, initial_setting_values)
-    editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, True, 'Default sine-wave sample', '')
+    editor_ui = sample_editor_native_ui.SampleEditorNativeUI(all_settings_info)
+    editor_ui.load_project_data(None, proj_manager.settings.snapshots, proj_manager.settings.effect_setting_values)
+    # editor_ui.update_current_sample(proj_manager.settings.snapshots[0], True, '')
     # vis_process = mp.Process(target=visualization_worker, args=(wave_queue, edit_params_queue))
     # vis_process.start()
     i = 0
@@ -580,15 +648,16 @@ if __name__ == '__main__':
             if event[0] == sample_editor_native_ui.OutgoingMessageType.SET_PROJECT_FOLDER:
                 _, new_folder = event
                 proj_manager.set_project_folder(new_folder)
-                if len(proj_manager.snapshot_data) > 0:
-                    synth.set_master_sample(proj_manager.snapshot_data[-1][1].copy(), proj_manager.settings.snapshots[-1].num_wavelengths)
+                if len(proj_manager.settings.snapshots) > 0:
+                    synth.set_master_sample(proj_manager.settings.snapshots[-1].sample_file.values.copy(), proj_manager.settings.snapshots[-1].num_wavelengths)
                     synth.loop_region_tree = proj_manager.settings.snapshots[-1].loop_tree.deep_copy()
+                    synth.set_modifiers(proj_manager.settings.snapshots[-1].fd_modifiers, proj_manager.settings.snapshots[-1].td_modifiers)
 
                 for effect_name, effect_settings in proj_manager.settings.effect_setting_values.items():
                     for setting_key, setting_value in effect_settings.items():
                         setattr(effects_by_type[effect_name], setting_key, setting_value)
 
-                editor_ui.load_project_data(new_folder, [(sample_data, metadata.num_wavelengths, metadata.loop_tree, metadata.description) for (file_path, sample_data), metadata in zip(proj_manager.snapshot_data, proj_manager.settings.snapshots)], proj_manager.settings.effect_setting_values)
+                editor_ui.load_project_data(new_folder, proj_manager.settings.snapshots, proj_manager.settings.effect_setting_values)
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_EDIT_WINDOW:
                 _, (new_lbound, new_hbound) = event
                 print(event)
@@ -598,9 +667,12 @@ if __name__ == '__main__':
                 new_loop_tree: LoopedRegion
                 synth.loop_region_tree = new_loop_tree
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_ACTIVE_SNAPSHOT:
+                snapshot_index: int
                 _, snapshot_index = event
-                synth.set_master_sample(proj_manager.snapshot_data[snapshot_index][1].copy(), proj_manager.settings.snapshots[snapshot_index].num_wavelengths)
-                synth.loop_region_tree = proj_manager.settings.snapshots[snapshot_index].loop_tree.deep_copy()
+                new_snapshot = proj_manager.settings.snapshots[snapshot_index]
+                synth.set_master_sample(new_snapshot.sample_file.values.copy(), new_snapshot.num_wavelengths)
+                synth.loop_region_tree = new_snapshot.loop_tree.deep_copy()
+                synth.set_modifiers(new_snapshot.fd_modifiers, new_snapshot.td_modifiers)
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_PROJECT_SETTING_VALUE:
                 _, setting_key, new_value = event
                 setattr(proj_manager.settings, setting_key, new_value)
@@ -609,6 +681,9 @@ if __name__ == '__main__':
                 _, effect_type_name, setting_key, new_value = event
                 setattr(effects_by_type[effect_type_name], setting_key, new_value)
                 print(setting_key + ' for ' + effect_type_name + ' was changed to ' + str(new_value) + '.')
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_ACTIVE_MODIFIER:
+                _, modifier_idx = event
+                synth.editing_modifier_index = modifier_idx
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_SAMPLE_SIZE:
                 _, new_wavelengths, add_mode = event
                 sample_desc = f'Resized sample from {synth.master_sample_wavelengths} to {new_wavelengths} wavelengths with mode {add_mode}.'
@@ -638,13 +713,15 @@ if __name__ == '__main__':
             if effects_since_last_checkpoint is not None:
                 sample_desc = 'Applied ' + sentence_from_list([type(effect).__name__ for effect in effects_since_last_checkpoint])
 
-            proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, sample_desc)
+            new_snapshot = proj_manager.append_snapshot(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, sample_desc, synth.fd_modifiers, synth.td_modifiers)
             if proj_manager.project_folder is not None:
                 proj_manager.write_project()
 
-            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, True, sample_desc, (type(effects_since_last_checkpoint[-1]).__name__ if effects_since_last_checkpoint else ''))
+            editor_ui.update_current_sample(new_snapshot, True, (type(effects_since_last_checkpoint[-1]).__name__ if effects_since_last_checkpoint else ''),
+                                            (None if synth.editing_modifier_index is None else (synth.fd_modifiers + synth.td_modifiers)[synth.editing_modifier_index]))
         elif i % 10000 == 0 and len(synth.current_effects) > 0:
-            editor_ui.update_current_sample(synth.master_sample, synth.master_sample_wavelengths, synth.loop_region_tree, False, '', '')
+            temp_snapshot = SampleEditorSnapshot(SnapshotExternalWAVFile(None, synth.master_sample), synth.master_sample_wavelengths, synth.loop_region_tree, '', synth.fd_modifiers, synth.td_modifiers)
+            editor_ui.update_current_sample(temp_snapshot, False, '', (None if synth.editing_modifier_index is None else (synth.fd_modifiers + synth.td_modifiers)[synth.editing_modifier_index]))
 
         if i % 1000 == 0 and synth.record_stream is not None:
             editor_ui.update_recording_status(True, synth.record_paused, synth.samples_recorded / synth.output_stream.samplerate)
