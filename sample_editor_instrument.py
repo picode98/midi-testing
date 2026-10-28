@@ -530,18 +530,37 @@ class SampleEditorSynth(CustomSynth):
                 osc.fd_modifiers = [dataclasses.replace(modifier) for modifier in self.fd_modifiers]
                 osc.td_modifiers = [dataclasses.replace(modifier) for modifier in self.td_modifiers]
 
-    def resize_sample(self, new_num_wavelengths: int, add_mode: sample_editor_native_ui.WavelengthAddMode):
+    def resize_master_sample(self, new_num_wavelengths: int, add_mode: sample_editor_native_ui.SampleExtendMode):
         new_sample = np.resize(self.master_sample, (new_num_wavelengths * self.sample_resolution,))
 
         if len(new_sample) > len(self.master_sample):
-            # Looping occurs by default; we only need to considers the other modes
-            if add_mode == sample_editor_native_ui.WavelengthAddMode.ADD_SILENCE:
+            # Looping occurs by default; we only need to consider the other modes
+            if add_mode == sample_editor_native_ui.SampleExtendMode.ADD_SILENCE:
                 new_sample[len(self.master_sample):] = 0.0
-            elif add_mode == sample_editor_native_ui.WavelengthAddMode.ADD_SINE_WAVE:
+            elif add_mode == sample_editor_native_ui.SampleExtendMode.ADD_SINE_WAVE:
                 sine_points = np.sin(np.linspace(-2.0 * np.pi * (len(new_sample) - len(self.master_sample)) / self.sample_resolution, 0.0, len(new_sample) - len(self.master_sample)))
                 new_sample[len(self.master_sample):] = sine_points
 
         self.set_master_sample(new_sample, new_num_wavelengths)
+
+    def get_modifier_sample_length(self, modifier_idx: int):
+        value_buf = (self.fd_modifiers + self.td_modifiers)[modifier_idx].value_buffer.values
+        return value_buf.shape[0] / self.output_stream.samplerate
+
+    def resize_modifier_sample(self, modifier_idx: int, new_length: float, add_mode: sample_editor_native_ui.SampleExtendMode):
+        value_buf = (self.fd_modifiers + self.td_modifiers)[modifier_idx].value_buffer
+        new_sample = np.resize(value_buf.values, (int(new_length * self.output_stream.samplerate),))
+
+        if len(new_sample) > len(value_buf.values):
+            # Looping occurs by default; we only need to consider the other modes
+            if add_mode == sample_editor_native_ui.SampleExtendMode.ADD_SILENCE:
+                new_sample[len(value_buf.values):] = 0.0
+
+        value_buf.values = new_sample
+
+        for osc_list in self.active_oscs.values():
+            for osc in osc_list:
+                (osc.fd_modifiers + osc.td_modifiers)[modifier_idx].value_buffer.values = new_sample
 
     def add_auto_loop_region(self, sample_range: Tuple[int, int], basis_frequency: float = 440.0):
         current_region = self.loop_region_tree
@@ -687,7 +706,12 @@ if __name__ == '__main__':
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_SAMPLE_SIZE:
                 _, new_wavelengths, add_mode = event
                 sample_desc = f'Resized sample from {synth.master_sample_wavelengths} to {new_wavelengths} wavelengths with mode {add_mode}.'
-                synth.resize_sample(new_wavelengths, add_mode)
+                synth.resize_master_sample(new_wavelengths, add_mode)
+                is_checkpoint = True
+            elif event[0] == sample_editor_native_ui.OutgoingMessageType.SET_MODIFIER_SAMPLE_SIZE:
+                _, modifier_idx, new_length, add_mode = event
+                sample_desc = f'Resized modifier sample from {synth.get_modifier_sample_length(modifier_idx):.2f} to {new_length:.2f} seconds with mode {add_mode}.'
+                synth.resize_modifier_sample(modifier_idx, new_length, add_mode)
                 is_checkpoint = True
             elif event[0] == sample_editor_native_ui.OutgoingMessageType.RECORD_START:
                 _, record_path = event
@@ -717,11 +741,10 @@ if __name__ == '__main__':
             if proj_manager.project_folder is not None:
                 proj_manager.write_project()
 
-            editor_ui.update_current_sample(new_snapshot, True, (type(effects_since_last_checkpoint[-1]).__name__ if effects_since_last_checkpoint else ''),
-                                            (None if synth.editing_modifier_index is None else (synth.fd_modifiers + synth.td_modifiers)[synth.editing_modifier_index]))
+            editor_ui.update_current_sample(new_snapshot, True, (type(effects_since_last_checkpoint[-1]).__name__ if effects_since_last_checkpoint else ''), synth.editing_modifier_index)
         elif i % 10000 == 0 and len(synth.current_effects) > 0:
             temp_snapshot = SampleEditorSnapshot(SnapshotExternalWAVFile(None, synth.master_sample), synth.master_sample_wavelengths, synth.loop_region_tree, '', synth.fd_modifiers, synth.td_modifiers)
-            editor_ui.update_current_sample(temp_snapshot, False, '', (None if synth.editing_modifier_index is None else (synth.fd_modifiers + synth.td_modifiers)[synth.editing_modifier_index]))
+            editor_ui.update_current_sample(temp_snapshot, False, '', synth.editing_modifier_index)
 
         if i % 1000 == 0 and synth.record_stream is not None:
             editor_ui.update_recording_status(True, synth.record_paused, synth.samples_recorded / synth.output_stream.samplerate)
@@ -729,7 +752,7 @@ if __name__ == '__main__':
 
             # new_edit_params = None
             # try:
-            #     while True:
+            #     while True:wavelengths
             #         new_edit_params = edit_params_queue.get_nowait()
             # except queue.Empty:
             #     pass
